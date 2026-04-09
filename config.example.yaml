@@ -1,0 +1,190 @@
+# Wicket IRC Bouncer Configuration
+#
+# Client connection password format:
+#   username@identifier/network:password
+#   username/network:password          (identifier defaults to *)
+#
+# The @identifier tracks per-device read positions, so each device
+# gets backscroll from where it last disconnected.
+#
+# ─── Cascading Settings ───
+#
+# The following settings can be defined at three levels. Each level
+# overrides the one above it:
+#
+#   1. Top level      (applies to all users and all networks)
+#   2. User level     (applies to all networks for that user)
+#   3. Network level  (applies to that specific network only)
+#
+# Cascading settings:
+#   nick, alt_nicks, user, ident_username, realname,
+#   delivery, delivery_source,
+#   auto_connect, rate_limit_ms, caps_wanted,
+#   upstream_caps, downstream_caps, replay_activity
+#
+# replay_activity also supports a fourth level: per-channel overrides
+# channel_replay_activity at the network level.
+#
+# nick and user default to the username if not set at any level.
+# ident_username defaults to user if not set at any level.
+
+listen:
+  host: "0.0.0.0"
+  # Sometimes ISPs block listening on ports below 1024, and sometimes
+  # they block listening on IRC ports 6660-6669 or even 6660-6699.
+  port: 6697
+  tls: true
+  tls_cert: "/etc/letsencrypt/live/[domain]/fullchain.pem"
+  tls_key: "/etc/letsencrypt/live/[domain]/privkey.pem"
+
+database: "wicket.db"
+server_name: "wicket"
+
+# ─── Top-level defaults (cascading) ───
+# These apply to all users and networks unless overridden.
+
+# nick: "DefaultNick"          # default IRC nick (defaults to username)
+# alt_nicks: ["Nick_", "Nick`"]  # fallback nicks
+# user: "DefaultUser"          # default IRC username/ident (defaults to username)
+# ident_username: "myident"    # ident server response (defaults to user)
+# realname: "Wicket User"      # default realname
+
+# delivery: "notice"           # "notice" or "privmsg" — how bouncer messages are sent
+# delivery_source: "*wicket"   # "*wicket" (shown as a nick) or "server" (shown in server window)
+
+# rate_limit_ms: 500           # minimum ms between messages sent to servers
+# caps_wanted: []              # extra IRCv3 caps to request beyond the defaults
+# upstream_caps: null          # full override for caps requested from servers (null = use built-in defaults)
+# downstream_caps: null        # full override for caps advertised to clients (null = use built-in defaults)
+# auto_connect: true           # whether networks connect on startup (default: true)
+# replay_activity: false           # auto-send channel activity (JOINs, PARTs, QUITs, etc.) on connect
+# replay_activity_target: "channel" # "channel" (deliver into the channel window) or "bouncer" (into *wicket / server window)
+
+logging:
+  level: "info"            # debug, info, warning, error
+  # file: "/var/log/wicket.log"  # omit for stderr only
+  # max_bytes: 10000000    # 10 MB, rotate when exceeded
+  # backup_count: 5        # keep 5 rotated log files
+  # log_irc: false         # log raw IRC traffic (very verbose)
+
+# Ident server (RFC 1413) — responds to IRC servers so you don't get ~ prefix.
+# Requires port 113 which typically needs root/admin privileges.
+# On Windows you'd need to run as administrator, or use a higher port with a port forward.
+# Some ISPs block port 113. No error is reported in that case.
+ident:
+  enabled: true
+  # host: "0.0.0.0"
+  # port: 113
+
+users:
+  Bob:
+    # Password: use a bcrypt hash for production.
+    # Generate with: python -c "import bcrypt; print(bcrypt.hashpw(b'hunter2', bcrypt.gensalt()).decode())"
+    # Or use plaintext for testing:
+    password: "password"
+
+    # ─── User-level defaults (cascading) ───
+    # These override top-level defaults and apply to all of Bob's networks.
+
+    nick: "Atreyu"
+    alt_nicks: ["Atreyu_", "Atreyu`"]
+    user: "Atreyu"
+    # ident_username: "atreyu"   # defaults to user ("Atreyu") if omitted
+    realname: "Fight the Nothing."
+
+    delivery: "privmsg"
+    delivery_source: "server"
+
+    # rate_limit_ms: 500     # inherited from top level if omitted
+    # caps_wanted: []        # inherited from top level if omitted
+    # auto_connect: true     # default for all networks (network can override)
+    # replay_activity: true  # auto-send activity on connect (inherited from top level if omitted)
+
+    networks:
+      libera:
+        # ─── Network-level overrides ───
+        # Anything set here overrides the user-level and top-level defaults.
+        # If nick, user, realname, etc. are omitted, they inherit from the
+        # user level above (Atreyu / Atreyu / "Fight the Nothing.").
+
+        # Network-level server password (used for all servers unless overridden):
+        # password: "letmein"
+
+        # Single server (use "server"):
+        server:
+          host: "irc.libera.chat"
+          port: 6697
+          tls: true
+          tls_verify: true
+          # password: "server_password"  # overrides network-level password
+
+        # Or multiple servers (use "servers") — tries each in order on failure:
+        # servers:
+        #   - host: "irc.libera.chat"
+        #     port: 6697
+        #     tls: true
+        #   - host: "irc.us.libera.chat"
+        #     port: 6697
+        #     tls: true
+        #   - host: "irc.eu.libera.chat"
+        #     port: 6697
+        #     tls: true
+
+        # SASL authentication (optional)
+        sasl:
+          mechanism: "PLAIN"
+          username: "Atreyu"
+          password: "drawssap"
+
+        # For SASL EXTERNAL (client certificate):
+        # sasl:
+        #   mechanism: "EXTERNAL"
+        #   cert_path: "/path/to/client-cert.pem"
+
+        # Channels to auto-join (use null for no key, or specify a channel key)
+        # Also accepts a simple list: ["#python", "#asyncio"]
+        autojoin:
+          "#linux": null
+          "#chat": "open_sesame"
+
+        # Rate limit: minimum ms between messages sent to this server.
+        # Overrides user-level and top-level defaults.
+        #
+        # Suggested values by network:
+        #   Libera/OFTC: 500ms (default)
+        #   EFnet/Undernet/DALnet: 1000ms
+        #   IRCnet: 2000-3000ms
+        #   QuakeNet/Rizon: 500ms
+        #
+        # If you get "Excess Flood" disconnects, increase this value.
+        rate_limit_ms: 500
+
+        auto_connect: true
+
+        # Extra IRCv3 caps to request beyond the defaults
+        caps_wanted: []
+
+        # Auto-replay activity (JOINs, PARTs, KICKs, MODEs, NICKs, QUITs)
+        # when a client connects. Cascades: top → user → network → channel.
+        # replay_activity: true    # inherited from user level if omitted
+
+        # Per-channel overrides for replay_activity.
+        # If a channel is not listed here, it uses the network-level setting.
+        # channel_replay_activity:
+        #   "#linux": true          # show activity for #linux even if network default is false
+        #   "#busy-channel": false  # suppress activity for a noisy channel
+
+      # Example second network — inherits nick/user/realname from user level:
+      # undernet:
+      #   nick: "DifferentNick"    # overrides user-level "Atreyu" for this network only
+      #   # user, realname, delivery, etc. all inherited from user level
+      #
+      #   server:
+      #     host: "irc.undernet.org"
+      #     port: 6697
+      #     tls: true
+      #
+      #   rate_limit_ms: 1000      # undernet needs a higher rate limit
+      #
+      #   autojoin:
+      #     - "#forum"
