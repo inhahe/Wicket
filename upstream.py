@@ -492,7 +492,15 @@ class UpstreamConnection:
                 target = param
                 break
 
+        # Fallback: some ircds only mention the channel in the trailing text
+        # (e.g. ":Target change too fast for #foo. Please wait 67 seconds.").
         if not target:
+            text_match = re.search(r'([#&!+][^\s,:]+)', msg.params[-1])
+            if text_match:
+                target = text_match.group(1)
+
+        if not target:
+            logger.debug("439/480/263 received but no channel found: %s", msg.params)
             return
 
         # Try to parse delay from the message text
@@ -515,6 +523,7 @@ class UpstreamConnection:
         # Dedup: if this channel is already queued, just push its retry_at
         # forward instead of appending. Otherwise repeated 439s for the same
         # channel pile up and cause hammering.
+        logger.debug("dedup target=%r queue=%r", target, [(e[0], round(e[2] - time.time(), 1)) for e in self._join_retry_queue])
         for i, (ch, k, _) in enumerate(self._join_retry_queue):
             if ch.lower() == target.lower():
                 self._join_retry_queue[i] = (ch, k if k is not None else key, retry_at)

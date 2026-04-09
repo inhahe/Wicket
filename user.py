@@ -205,14 +205,14 @@ class User:
     ) -> None:
         """Send a bouncer-generated message into a channel window.
 
-        Used by activity replay so events appear in context. The source is
-        the bouncer's delivery source, so clients render it as coming from
-        *wicket / wicket rather than a real channel member.
+        Used by activity replay so events appear in context. Always sent as
+        PRIVMSG (not NOTICE) regardless of the user's `delivery` setting,
+        because NOTICE in a channel renders awkwardly in most clients and
+        some treat it as an external/server message.
         """
         source = self.get_delivery_source()
-        cmd = self.get_delivery_command()
         msg = IRCMessage(
-            command=cmd,
+            command="PRIVMSG",
             params=[channel, text],
             source=source,
         )
@@ -821,9 +821,25 @@ class User:
         if cmd == "376" or cmd == "422":
             # End of MOTD or no MOTD - join channels now
             await upstream.join_channels()
-            # Notify any pre-attached clients that upstream is now online
+            # Notify any pre-attached clients that upstream is now online,
+            # and push an updated 005 ISUPPORT so clients (e.g. mIRC) can pick
+            # up the real NETWORK name now that we know it.
             for ds in self.downstreams.get(network, []):
                 self.deliver_bouncer_message(ds, f"Upstream {network} is now connected")
+                if upstream.isupport:
+                    tokens = []
+                    for key, val in upstream.isupport.items():
+                        if val is not None:
+                            tokens.append(f"{key}={val}")
+                        else:
+                            tokens.append(key)
+                    for i in range(0, len(tokens), 13):
+                        batch = tokens[i : i + 13]
+                        await ds.send(IRCMessage(
+                            command="005",
+                            params=[ds.nick] + batch + ["are supported by this server"],
+                            source=self.server_name,
+                        ))
 
     async def route_downstream_message(
         self, ds: DownstreamConnection, msg: IRCMessage
@@ -844,10 +860,16 @@ class User:
         upstream = self.upstreams.get(ds.network)
         cmd = msg.command
 
-        # Handle bouncer commands even when upstream is disconnected
+        # Handle bouncer commands even when upstream is disconnected.
+        # Match against just the nick (or server_name if delivery_source is "server"),
+        # not the full nick!user@host form.
         if cmd in ("PRIVMSG", "NOTICE") and msg.params:
             target = msg.params[0]
-            if target.lower() == self.get_delivery_source().lower():
+            if self.config.delivery_source == "server":
+                bouncer_target = self.server_name
+            else:
+                bouncer_target = self.config.delivery_source
+            if target.lower() == bouncer_target.lower():
                 await self._handle_bouncer_command(ds, msg.params[1] if len(msg.params) > 1 else "")
                 return
 

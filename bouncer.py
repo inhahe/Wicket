@@ -422,6 +422,13 @@ def main() -> None:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, lambda: asyncio.ensure_future(bouncer.shutdown()))
             loop.add_signal_handler(signal.SIGHUP, lambda: asyncio.ensure_future(bouncer.rehash()))
+        else:
+            # Windows: loop.add_signal_handler isn't supported. Install a
+            # plain signal.signal handler that schedules shutdown on the
+            # loop from the signal context (call_soon_threadsafe is signal-safe).
+            def _win_sigint(_signum, _frame):
+                loop.call_soon_threadsafe(lambda: asyncio.ensure_future(bouncer.shutdown()))
+            signal.signal(signal.SIGINT, _win_sigint)
 
         try:
             await bouncer.start()
