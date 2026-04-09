@@ -113,6 +113,8 @@ per-device replay, IRCv3 caps, SASL, ident, deployment, and troubleshooting.
 
 Note that currently the bouncer seems to have a bug where if joining channels is throttled due to 'target change too fast' (I get this on Undernet sometimes), and there's a number of channels in the line-up, it'll keep cycling through them one every couple of seconds and the target change wait time will never go down. It's hard to debug because I have to wait till I land on a server that has this join throttling again with the new log output enabled. 
 
+I think it also might have a bug where the client thinks it's in a channel named after your "real name" because Wicket is using an ircv3 "extended join" cap when the client doesn't support it, or something like that, even though Claude insists that the bug has been fixed. But it's not necessarily still a bug, I could have just still been caught in a cycle of clients and bouncers autojoining the "real name" channel because bouncer and client instances kept telling each other to join. 
+
 ## License
 
 MIT

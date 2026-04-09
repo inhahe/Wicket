@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import logging.handlers
+import os
 import signal
 import ssl
 import sys
@@ -443,19 +444,26 @@ def main() -> None:
         # shutdown() has a guard against being called twice
         loop.run_until_complete(bouncer.shutdown())
     finally:
-        # Cancel any remaining tasks
+        # Cancel any remaining tasks. Use asyncio.wait (not wait_for+gather)
+        # because wait_for re-awaits a cancelled coro, which hangs forever
+        # if any task swallows CancelledError (e.g. shielded TLS I/O).
         pending = asyncio.all_tasks(loop)
         for task in pending:
             task.cancel()
         if pending:
             try:
-                loop.run_until_complete(asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
-                    timeout=3.0,
-                ))
+                loop.run_until_complete(
+                    asyncio.wait(pending, timeout=3.0)
+                )
             except (asyncio.TimeoutError, KeyboardInterrupt):
                 pass
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
+        # Force-exit to avoid hanging on uncancellable background threads
+        # (e.g. aiosqlite's worker thread). All meaningful cleanup is done.
+        os._exit(0)
 
 
 if __name__ == "__main__":
