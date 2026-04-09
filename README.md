@@ -109,6 +109,10 @@ if `delivery_source: server`):
 See [DOCS.md](DOCS.md) for the full reference: configuration, cascading,
 per-device replay, IRCv3 caps, SASL, ident, deployment, and troubleshooting.
 
+## Known bug(s)
+
+Note that currently the bouncer seems to have a bug where if joining channels is throttled due to 'target change too fast' (I get this on Undernet sometimes), and there's a number of channels in the line-up, it'll keep cycling through them one every couple of seconds and the target change wait time will never go down. It's hard to debug because I have to wait till I land on a server that has this join throttling again with the new log output enabled. 
+
 ## License
 
 MIT
