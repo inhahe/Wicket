@@ -519,19 +519,33 @@ class UpstreamConnection:
                     key = k
                     break
 
-        retry_at = time.time() + delay
-        # Dedup: if this channel is already queued, just push its retry_at
-        # forward instead of appending. Otherwise repeated 439s for the same
-        # channel pile up and cause hammering.
-        logger.debug("dedup target=%r queue=%r", target, [(e[0], round(e[2] - time.time(), 1)) for e in self._join_retry_queue])
-        for i, (ch, k, _) in enumerate(self._join_retry_queue):
+        now = time.time()
+        retry_at = now + delay
+
+        # The server's target-change throttle is per-connection, not
+        # per-channel.  When ANY join gets a 439, push ALL queued entries
+        # forward so we don't immediately fire the next one and keep the
+        # throttle timer from ever expiring.
+        logger.debug("dedup target=%r queue=%r", target, [(e[0], round(e[2] - now, 1)) for e in self._join_retry_queue])
+
+        found = False
+        for i, (ch, k, old_at) in enumerate(self._join_retry_queue):
             if ch.lower() == target.lower():
+                # The channel that just got 439: schedule it at retry_at
                 self._join_retry_queue[i] = (ch, k if k is not None else key, retry_at)
-                logger.info("Pushing JOIN retry for %s on %s out by %ds", target, self.network_name, delay)
-                break
-        else:
+                found = True
+            elif old_at < retry_at:
+                # Other channels scheduled before the cooldown expires:
+                # push them back so they don't fire during the wait.
+                # Spread them out by 2s each after retry_at so they
+                # don't all fire at the same instant.
+                self._join_retry_queue[i] = (ch, k, retry_at + 2 * (i + 1))
+
+        if not found:
             self._join_retry_queue.append((target, key, retry_at))
             logger.info("Will retry JOIN %s on %s in %ds", target, self.network_name, delay)
+        else:
+            logger.info("439 for %s on %s — pushed ALL retries back by %ds", target, self.network_name, delay)
 
         # Start the retry task if not already running
         if self._join_retry_task is None or self._join_retry_task.done():
@@ -556,7 +570,7 @@ class UpstreamConnection:
                 # from the queue when we see our own JOIN message.
                 for i, (ch, k, _) in enumerate(self._join_retry_queue):
                     if ch.lower() == channel.lower():
-                        self._join_retry_queue[i] = (ch, k, now + 300)
+                        self._join_retry_queue[i] = (ch, k, time.time() + 300)
                         break
                 logger.info("Retrying JOIN %s on %s", channel, self.network_name)
                 if key:
