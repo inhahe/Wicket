@@ -890,9 +890,16 @@ class User:
                     if other_ds is not ds:
                         await self._forward_to_downstream(other_ds, our_msg)
 
-            # Track that we need to suppress the echo from upstream
-            ds_id = id(ds)
-            self._echo_suppress[ds_id] = self._echo_suppress.get(ds_id, 0) + 1
+            # If upstream has echo-message, it will echo this PRIVMSG back
+            # to us.  Suppress that echo for ALL connected clients: the
+            # sender's client already displayed it locally (we don't
+            # advertise echo-message downstream), and other clients already
+            # received it via the forward above.
+            if upstream and upstream.cap.supports("echo-message"):
+                if ds.network in self.downstreams:
+                    for suppress_ds in self.downstreams[ds.network]:
+                        sid = id(suppress_ds)
+                        self._echo_suppress[sid] = self._echo_suppress.get(sid, 0) + 1
 
         # PING - handle locally
         if cmd == "PING":
