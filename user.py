@@ -1017,8 +1017,17 @@ class User:
         if upstream.connected:
             self.deliver_bouncer_message(ds, f"Already connected to {net_name}")
             return
+        # Cancel any in-flight reconnect to avoid duplicate connections.
+        if upstream._reconnect_task and not upstream._reconnect_task.done():
+            upstream._reconnect_task.cancel()
+            try:
+                await upstream._reconnect_task
+            except asyncio.CancelledError:
+                pass
+            upstream._reconnect_task = None
         self.deliver_bouncer_message(ds, f"Connecting to {net_name}...")
         upstream._should_reconnect = True
+        upstream._reconnect_delay = 1.0  # Reset backoff for user-initiated connect
         await upstream.connect()
 
     async def _handle_disconnect(self, ds: DownstreamConnection, args: list[str]) -> None:

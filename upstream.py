@@ -107,10 +107,9 @@ class UpstreamConnection:
                 logger.warning("Connection failed to %s:%d: %s", sc.host, sc.port, e)
                 continue  # Try next server
 
-            # Connected successfully
+            # Connected successfully (TCP level — registration may still fail)
             self._server_index = idx
             self.connected = True
-            self._reconnect_delay = 1.0
 
             # Register with ident server
             if self._ident_server:
@@ -136,6 +135,15 @@ class UpstreamConnection:
     async def disconnect(self, reason: str = "Disconnecting") -> None:
         """Gracefully disconnect from the server."""
         self._should_reconnect = False
+        # Cancel any pending reconnect task first — otherwise a sleeping
+        # reconnect wakes up after cleanup and opens a new connection.
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+        self._reconnect_task = None
         if self.connected and self.writer:
             try:
                 await self.send_now(IRCMessage(command="QUIT", params=[reason]))
@@ -184,14 +192,23 @@ class UpstreamConnection:
         self.writer = None
 
     def _schedule_reconnect(self) -> None:
-        if self._should_reconnect and self._reconnect_task is None:
-            self._reconnect_task = asyncio.create_task(self._reconnect())
-
-    async def _reconnect(self) -> None:
-        await self._cleanup()
-        logger.info("Reconnecting to %s in %.0fs", self.network_name, self._reconnect_delay)
-        await asyncio.sleep(self._reconnect_delay)
+        if not self._should_reconnect:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return  # A reconnect is already in progress
+        # Capture the current delay for this attempt, then bump for next time.
+        delay = self._reconnect_delay
         self._reconnect_delay = min(self._reconnect_delay * 2, 300)
+        self._reconnect_task = asyncio.create_task(self._reconnect(delay))
+
+    async def _reconnect(self, delay: float) -> None:
+        await self._cleanup()
+        if not self._should_reconnect:
+            return
+        logger.info("Reconnecting to %s in %.0fs", self.network_name, delay)
+        await asyncio.sleep(delay)
+        if not self._should_reconnect:
+            return
         self._reconnect_task = None
         # Reset state for new connection
         self.cap = CapNegotiator(
@@ -274,6 +291,24 @@ class UpstreamConnection:
         """Handle a message from the IRC server."""
         cmd = msg.command
 
+        # ERROR from server — connection is about to close.  Adjust the
+        # reconnect delay based on the reason so we don't hammer the server.
+        if cmd == "ERROR":
+            error_text = (msg.params[0] if msg.params else "").lower()
+            if "banned" in error_text or "gline" in error_text or "kline" in error_text:
+                # Hard ban — back off for a long time.
+                self._reconnect_delay = max(self._reconnect_delay, 300)
+                logger.warning("Banned from %s, backing off to %.0fs",
+                               self.network_name, self._reconnect_delay)
+            elif "throttle" in error_text or "too fast" in error_text or "reconnect" in error_text:
+                # Throttled — moderate backoff.
+                self._reconnect_delay = max(self._reconnect_delay, 30)
+                logger.warning("Throttled on %s, backing off to %.0fs",
+                               self.network_name, self._reconnect_delay)
+            # Forward ERROR to downstream clients so the user sees it
+            await self.user.route_upstream_message(self.network_name, msg)
+            return
+
         # PING/PONG - respond immediately
         if cmd == "PING":
             await self.send_now(IRCMessage(command="PONG", params=msg.params))
@@ -322,6 +357,7 @@ class UpstreamConnection:
                 if msg.params:
                     self.nick = msg.params[0]
                 self.registered = True
+                self._reconnect_delay = 1.0  # Reset backoff on successful registration
                 logger.info("Registered on %s as %s", self.network_name, self.nick)
             if cmd == "005":
                 self._parse_isupport(msg)
