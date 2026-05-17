@@ -75,12 +75,35 @@ class UpstreamConnection:
         self._join_retry_queue: list[tuple[str, str | None, float]] = []
         self._join_retry_task: Optional[asyncio.Task] = None
 
+        # Guard against concurrent connect() calls.  Without this, a second
+        # connect() during the first's open_connection() await would orphan
+        # the first connection (overwriting reader/writer/_read_task),
+        # creating zombie connections that are never cleaned up.
+        self._connecting: bool = False
+
     async def connect(self) -> None:
         """Connect to the IRC server, trying each configured server in order."""
+        if self._connecting:
+            logger.debug("connect() already in progress for %s, skipping",
+                         self.network_name)
+            return
+        self._connecting = True
+        try:
+            await self._connect_inner()
+        finally:
+            self._connecting = False
+
+    async def _connect_inner(self) -> None:
+        """Inner connection logic (guarded by _connecting flag)."""
         servers = self.network_config.servers
         if not servers:
             logger.error("No servers configured for %s", self.network_name)
             return
+
+        # Clean up any existing connection state to avoid orphaned sockets.
+        # This is idempotent and harmless if already cleaned up.
+        if self.connected or self.writer:
+            await self._cleanup()
 
         # Try each server starting from the current index
         for attempt in range(len(servers)):
