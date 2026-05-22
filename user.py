@@ -31,7 +31,7 @@ ROUTED_REPLIES: dict[str, tuple[set[str], set[str], set[str]]] = {
     "WHOIS": (
         {"311", "312", "313", "317", "319", "301", "330", "338", "671", "307", "320", "276"},
         {"318"},  # RPL_ENDOFWHOIS
-        {"401", "402"},  # ERR_NOSUCHNICK, ERR_NOSUCHSERVER
+        {"263", "401", "402"},  # 263 = ERR_TRYAGAIN; ERR_NOSUCHNICK, ERR_NOSUCHSERVER
     ),
     "WHOWAS": (
         {"314", "312"},
@@ -41,12 +41,12 @@ ROUTED_REPLIES: dict[str, tuple[set[str], set[str], set[str]]] = {
     "WHO": (
         {"352", "354"},  # RPL_WHOREPLY, RPL_WHOSPCRPL (for WHOX)
         {"315"},  # RPL_ENDOFWHO
-        {"401", "402"},
+        {"263", "401", "402"},  # 263 = ERR_TRYAGAIN (rate-limited)
     ),
     "LIST": (
         {"322"},  # RPL_LIST
         {"323"},  # RPL_LISTEND
-        set(),
+        {"263"},  # 263 = ERR_TRYAGAIN (rate-limited)
     ),
     "NAMES": (
         {"353"},  # RPL_NAMREPLY
@@ -61,7 +61,7 @@ ROUTED_REPLIES: dict[str, tuple[set[str], set[str], set[str]]] = {
     "LINKS": (
         {"364"},  # RPL_LINKS
         {"365"},  # RPL_ENDOFLINKS
-        set(),
+        {"263"},  # 263 = ERR_TRYAGAIN (rate-limited)
     ),
     "INFO": (
         {"371"},  # RPL_INFO
