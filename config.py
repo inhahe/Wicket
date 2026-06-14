@@ -84,6 +84,15 @@ class NetworkConfig:
     sasl: Optional[SASLConfig] = None
     autojoin: dict[str, str | None] = field(default_factory=dict)  # channel -> key or None
     rate_limit_ms: int = 500
+    # After an *unclean* disconnect (local socket/network abort — not a clean
+    # server-initiated close), wait at least this many seconds before
+    # reconnecting.  The server keeps our old session as a "ghost" until its
+    # PING timeout; reconnecting sooner makes the ghost and the new session both
+    # count against the server's per-IP connection limit, which can trigger an
+    # "excessive connections" auto-ban (e.g. undernet ex-conn G-line).  Should
+    # be larger than the network's PING timeout (~2-3 min on undernet).  0
+    # disables the wait (fast reconnect even after an unclean drop).
+    unclean_reconnect_delay: float = 240.0
     auto_connect: bool = True
     caps_wanted: list[str] = field(default_factory=list)
     upstream_caps: Optional[list[str]] = None  # Full override for upstream caps (None = use defaults)
@@ -104,6 +113,7 @@ class UserConfig:
     realname: str = ""  # Default realname for all networks
     auto_connect: bool = True  # Default auto_connect for all networks
     rate_limit_ms: int = 500  # Default rate limit for all networks
+    unclean_reconnect_delay: float = 240.0  # Default ghost-reap reconnect delay for all networks
     caps_wanted: list[str] = field(default_factory=list)  # Default extra caps for all networks
     upstream_caps: Optional[list[str]] = None  # Full override for upstream caps
     downstream_caps: Optional[list[str]] = None  # Full override for downstream caps
@@ -160,6 +170,7 @@ class BouncerConfig:
     upstream_caps: Optional[list[str]] = None
     downstream_caps: Optional[list[str]] = None
     rate_limit_ms: int = 500
+    unclean_reconnect_delay: float = 240.0
     auto_connect: bool = True
     replay_activity: bool = False
     replay_activity_target: str = "channel"
@@ -199,6 +210,7 @@ class BouncerConfig:
         config.delivery_source = raw.get("delivery_source", "*wicket")
         config.caps_wanted = raw.get("caps_wanted", [])
         config.rate_limit_ms = raw.get("rate_limit_ms", 500)
+        config.unclean_reconnect_delay = raw.get("unclean_reconnect_delay", 240.0)
         config.upstream_caps = raw.get("upstream_caps")
         config.downstream_caps = raw.get("downstream_caps")
         config.auto_connect = raw.get("auto_connect", True)
@@ -237,6 +249,7 @@ class BouncerConfig:
                 user_realname = udata.get("realname", config.realname)
                 user_auto_connect = udata.get("auto_connect", config.auto_connect)
                 user_rate_limit_ms = udata.get("rate_limit_ms", config.rate_limit_ms)
+                user_unclean_reconnect_delay = udata.get("unclean_reconnect_delay", config.unclean_reconnect_delay)
                 user_caps_wanted = udata.get("caps_wanted", config.caps_wanted)
                 user_delivery = udata.get("delivery", config.delivery)
                 user_delivery_source = udata.get("delivery_source", config.delivery_source)
@@ -255,6 +268,7 @@ class BouncerConfig:
                     realname=user_realname,
                     auto_connect=user_auto_connect,
                     rate_limit_ms=user_rate_limit_ms,
+                    unclean_reconnect_delay=user_unclean_reconnect_delay,
                     caps_wanted=user_caps_wanted,
                     delivery=user_delivery,
                     delivery_source=user_delivery_source,
@@ -327,6 +341,7 @@ class BouncerConfig:
                             sasl=sasl,
                             autojoin=autojoin,
                             rate_limit_ms=ndata.get("rate_limit_ms", user_rate_limit_ms),
+                            unclean_reconnect_delay=ndata.get("unclean_reconnect_delay", user_unclean_reconnect_delay),
                             auto_connect=ndata.get("auto_connect", user_auto_connect),
                             caps_wanted=ndata.get("caps_wanted", user_caps_wanted),
                             upstream_caps=ndata.get("upstream_caps", user_upstream_caps),

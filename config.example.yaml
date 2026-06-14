@@ -19,7 +19,7 @@
 # Cascading settings:
 #   nick, alt_nicks, user, ident_username, realname,
 #   delivery, delivery_source,
-#   auto_connect, rate_limit_ms, caps_wanted,
+#   auto_connect, rate_limit_ms, unclean_reconnect_delay, caps_wanted,
 #   upstream_caps, downstream_caps, replay_activity
 #
 # replay_activity also supports a fourth level: per-channel overrides
@@ -53,6 +53,13 @@ server_name: "wicket"
 # delivery_source: "*wicket"   # "*wicket" (shown as a nick) or "server" (shown in server window)
 
 # rate_limit_ms: 500           # minimum ms between messages sent to servers
+# unclean_reconnect_delay: 240 # seconds to wait before reconnecting after an
+#                              # UNCLEAN drop (socket abort / network blip), to let
+#                              # the server reap the old "ghost" session before the
+#                              # new one connects. Prevents "excessive connections"
+#                              # bans on networks that count ghosts per-IP (undernet).
+#                              # Must exceed the network's PING timeout (~2-3 min).
+#                              # Clean server-initiated disconnects ignore this.
 # caps_wanted: []              # extra IRCv3 caps to request beyond the defaults
 # upstream_caps: null          # full override for caps requested from servers (null = use built-in defaults)
 # downstream_caps: null        # full override for caps advertised to clients (null = use built-in defaults)
@@ -185,6 +192,8 @@ users:
       #     tls: true
       #
       #   rate_limit_ms: 1000      # undernet needs a higher rate limit
+      #   unclean_reconnect_delay: 300  # undernet bans excessive connections per-IP;
+      #                                 # wait past the PING timeout to clear ghosts
       #
       #   autojoin:
       #     - "#forum"

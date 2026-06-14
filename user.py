@@ -826,6 +826,18 @@ class User:
             # up the real NETWORK name now that we know it.
             for ds in self.downstreams.get(network, []):
                 self.deliver_bouncer_message(ds, f"Upstream {network} is now connected")
+                # If the upstream re-registered under a different nick (e.g. an
+                # alt nick because our primary was still ghosted after a
+                # disconnect), the client still thinks it has the old nick.
+                # A re-registration doesn't generate a server NICK message, so
+                # tell the client explicitly and resync ds.nick — otherwise the
+                # client's idea of "my nick" stays wrong until it reconnects.
+                if upstream.nick and ds.nick.lower() != upstream.nick.lower():
+                    await ds.send(IRCMessage(
+                        command="NICK", params=[upstream.nick],
+                        source=f"{ds.nick}!{upstream.username}@{self.server_name}",
+                    ))
+                    ds.nick = upstream.nick
                 if upstream.isupport:
                     tokens = []
                     for key, val in upstream.isupport.items():
@@ -1027,7 +1039,10 @@ class User:
             upstream._reconnect_task = None
         self.deliver_bouncer_message(ds, f"Connecting to {net_name}...")
         upstream._should_reconnect = True
-        upstream._reconnect_delay = 1.0  # Reset backoff for user-initiated connect
+        # Reset all backoff state for a user-initiated connect.
+        upstream._reconnect_delay = 1.0
+        upstream._min_reconnect_delay = 0.0
+        upstream._consecutive_bans = 0
         await upstream.connect()
 
     async def _handle_disconnect(self, ds: DownstreamConnection, args: list[str]) -> None:
