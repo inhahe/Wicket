@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 from typing import TYPE_CHECKING, Optional
 
 from irc_parser import IRCMessage
@@ -90,6 +91,7 @@ class DownstreamConnection:
         self._detached: bool = False
         self._read_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+        self._last_activity: float = time.monotonic()
 
     async def start(self) -> None:
         """Start handling this client connection."""
@@ -105,6 +107,7 @@ class DownstreamConnection:
                 data = await self.reader.read(4096)
                 if not data:
                     break
+                self._last_activity = time.monotonic()
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
@@ -133,20 +136,58 @@ class DownstreamConnection:
         finally:
             await self._on_disconnect()
 
+    # How often the ping loop wakes to check liveness.
+    _PING_CHECK_INTERVAL = 30
+    # Send a PING once the client has been idle this long.
+    _PING_IDLE = 60
+    # Reap the connection once the client has been idle this long with no
+    # response (covers unclean disconnects where reader.read() never returns).
+    _PING_TIMEOUT = 180
+
     async def _ping_loop(self) -> None:
-        """Periodically ping the client to detect disconnections."""
+        """Periodically ping the client and reap dead connections.
+
+        On an unclean client disconnect (e.g. a laptop sleeping or a network
+        drop) the read loop stays blocked in ``reader.read()`` forever, so its
+        ``finally`` never runs and read positions are never saved. This loop
+        detects the dead connection via an activity timeout and forces the
+        teardown (which persists read positions) explicitly.
+        """
         try:
             while not self._closed:
-                await asyncio.sleep(60)
+                await asyncio.sleep(self._PING_CHECK_INTERVAL)
                 if self._closed:
                     break
-                try:
+                idle = time.monotonic() - self._last_activity
+                if idle >= self._PING_TIMEOUT:
+                    logger.info(
+                        "Client %s@%s/%s timed out (idle %.0fs); reaping",
+                        self.nick, self.identifier, self.network or "?", idle,
+                    )
+                    await self._force_disconnect()
+                    break
+                if idle >= self._PING_IDLE:
                     await self.send(IRCMessage(
                         command="PING", params=[self.bouncer.config.server_name],
                     ))
-                except (ConnectionError, OSError):
-                    break
+                    if self._closed:
+                        # send() detected a dead socket.
+                        await self._force_disconnect()
+                        break
         except asyncio.CancelledError:
+            pass
+
+    async def _force_disconnect(self) -> None:
+        """Tear down an unresponsive/dead connection.
+
+        Runs the idempotent ``_on_disconnect()`` (which saves read positions)
+        and closes the writer to unblock any pending ``reader.read()`` in the
+        read loop.
+        """
+        await self._on_disconnect()
+        try:
+            self.writer.close()
+        except (OSError, ConnectionError):
             pass
 
     async def send(self, msg: IRCMessage) -> None:
