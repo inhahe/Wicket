@@ -133,17 +133,52 @@ Wicket stores every received message in SQLite and tracks a separate
 
 That means if you've configured Bob to connect from two devices —
 say, `Bob@laptop/libera` and `Bob@phone/libera` — each device will
-only receive backscroll for messages it hasn't seen yet. When the
-laptop disconnects, its read position is saved at the latest message
-ID; when it reconnects later, replay starts from that ID, skipping
-anything the phone has already delivered to itself.
+only receive backscroll for messages it hasn't seen yet. On reconnect,
+replay starts from that device's read position, skipping anything it
+has already been shown.
 
 If you connect with no identifier (`Bob/libera:...`), all such
 unidentified connections share the `*` slot.
 
-Read positions are saved on disconnect (including unclean
-disconnects, as long as the TCP socket closes). They are also saved
-when a client sends `QUIT`.
+A device's read position advances as soon as messages are delivered to
+it, so it never re-sees the same backscroll:
+
+- **Right after connecting**, once the backscroll (and any activity)
+  has been replayed, the read position is bumped to the latest message
+  ID — so that batch is not replayed again next time.
+- **While connected**, read positions are re-persisted on a timer
+  (every `READ_FLUSH_INTERVAL` seconds, default 30). A connected client
+  has received every message forwarded since it attached, so its read
+  position is simply the latest stored ID.
+- **On disconnect** (including unclean disconnects where the TCP socket
+  closes, and on `QUIT`), read positions are saved a final time.
+
+The timer matters because read positions used to advance *only* on a
+clean disconnect. A system restart kills both the bouncer and the
+client before either can save, so the read position froze and the last
+several days of messages replayed on every start. Flushing on a timer
+bounds that loss to one interval.
+
+### Targets a device has never seen
+
+A device only has a read position for a target once it has been
+attached while that target had messages stored. A target that first
+appears while the device is detached — typically a new private-message
+partner — therefore has no read position at all when the device next
+connects.
+
+That is *not* the same as a read position of zero, so Wicket does not
+replay the target's entire stored history. It replays at most the last
+`INITIAL_REPLAY_LINES` messages (default 200), which in practice means
+a new PM partner's whole conversation still arrives, while a long-lived
+channel does not dump thousands of lines on first sight.
+
+### Very large backlogs
+
+At most `REPLAY_LIMIT` messages (default 4096) are replayed per target
+per connect. If a target has more unread than that, the read position
+advances only as far as what was actually sent, so the remainder is
+replayed on the following connect instead of being skipped.
 
 ---
 
@@ -588,10 +623,12 @@ automatically; if you still see this, make sure you're on a recent
 build.
 
 **Backscroll replays messages you've already seen** — Read positions
-are saved on disconnect. If your client crashes mid-session before
-sending `QUIT` and the TCP socket isn't cleanly closed, the last
-read position may not be saved. Reconnect and disconnect cleanly to
-update it.
+advance right after each connect's replay and again on a timer while
+connected (see [Per-device backscroll](#per-device-backscroll)), so at
+most one flush interval (default 30s) of messages can replay after an
+unclean shutdown. If you see *more* than that replay repeatedly, check
+that the client connects with a stable `@identifier` (positions are
+keyed per identifier) and that Wicket has write access to its database.
 
 **Ident shows `~` prefix anyway** — Either ident isn't enabled,
 your ISP blocks port 113, or the IRC server didn't query in time.

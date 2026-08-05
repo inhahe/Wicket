@@ -175,6 +175,13 @@ class User:
             DownstreamConnection, str, set[str], set[str], set[str], float
         ]]] = {}
 
+        # Background task that periodically persists read positions for connected
+        # clients (see _read_flush_loop). Read positions used to advance only on a
+        # clean disconnect, which is lost when a system restart kills both the
+        # bouncer and the client -- the cause of the whole backlog replaying on
+        # every start.
+        self._read_flush_task: Optional[asyncio.Task] = None
+
     def get_delivery_source(self) -> str:
         """Get the source for bouncer-generated messages."""
         if self.config.delivery_source == "server":
@@ -235,6 +242,7 @@ class User:
         ds.identifier = identifier
         ds.upstream = upstream
 
+        capped: dict[str, int] = {}
         try:
             # Send welcome (degraded if upstream is disconnected)
             await self._send_welcome(ds, upstream)
@@ -247,7 +255,7 @@ class User:
                             await self._replay_channel(ds, upstream, chan_state)
 
                 # Replay backscroll
-                await self._replay_backscroll(ds, network, identifier)
+                capped = await self._replay_backscroll(ds, network, identifier)
 
                 # Auto-replay activity if enabled
                 nc = self.config.networks.get(network)
@@ -261,7 +269,7 @@ class User:
                         f"use CONNECT {network} to connect)")
 
                 # Still replay backscroll from previous sessions
-                await self._replay_backscroll(ds, network, identifier)
+                capped = await self._replay_backscroll(ds, network, identifier)
 
                 nc = self.config.networks.get(network)
                 if nc and nc.replay_activity:
@@ -269,6 +277,19 @@ class User:
         except Exception:
             logger.exception("Error during attach for %s/%s", self.username, network)
             return False
+
+        # Mark everything we just replayed as read so the same backscroll isn't
+        # replayed again on the next connect. Read positions previously advanced
+        # only on a clean disconnect (which the client rarely gets to do -- a
+        # system restart kills it first), so they froze and the last few days of
+        # messages replayed on every start.
+        try:
+            await self._update_read_positions(ds, capped=capped)
+        except Exception:
+            logger.exception("Error marking replay read for %s/%s", self.username, network)
+        # Keep read positions current for the life of this connection so an
+        # unclean shutdown loses at most one flush interval, not days.
+        self._ensure_read_flush_task()
 
         return True
 
@@ -291,8 +312,16 @@ class User:
             except Exception:
                 logger.exception("Error updating read positions for %s", ds.nick)
 
-    async def _update_read_positions(self, ds: DownstreamConnection) -> None:
-        """Update read positions for all targets when a client disconnects."""
+    async def _update_read_positions(
+        self, ds: DownstreamConnection, capped: dict[str, int] | None = None
+    ) -> None:
+        """Update read positions for all targets when a client disconnects.
+
+        `capped` maps target -> highest id actually delivered for targets whose
+        attach-time replay was truncated at REPLAY_LIMIT. Those must not be
+        advanced to the latest stored id, or the tail we never sent would be
+        marked read and never replayed.
+        """
         network = ds.network
         if not network:
             return
@@ -301,13 +330,65 @@ class User:
         logger.debug("Saving read positions for %s/%s/%s: %d targets",
                       self.username, network, ds.identifier, len(targets))
         for target in targets:
-            latest = await self.db.get_latest_message_id(self.username, network, target)
+            if capped and target.lower() in capped:
+                latest = capped[target.lower()]
+            else:
+                latest = await self.db.get_latest_message_id(self.username, network, target)
             if latest is not None:
                 await self.db.set_read_position(
                     self.username, network, ds.identifier, target, latest
                 )
                 logger.debug("  read position %s/%s/%s/%s = %d",
                              self.username, network, ds.identifier, target, latest)
+
+    # How often to persist read positions for connected clients (seconds). This
+    # bounds how much backlog can replay after an unclean shutdown (e.g. a system
+    # restart that kills the bouncer and client before either can save cleanly).
+    READ_FLUSH_INTERVAL = 30
+
+    def _ensure_read_flush_task(self) -> None:
+        """Start the periodic read-position flush task if it isn't running."""
+        if self._read_flush_task is None or self._read_flush_task.done():
+            self._read_flush_task = asyncio.create_task(self._read_flush_loop())
+
+    async def _read_flush_loop(self) -> None:
+        """Periodically persist read positions for every connected downstream.
+
+        A connected client has, by definition, received every message forwarded
+        since it attached, so its read position is simply the latest stored id per
+        target. Persisting that on a timer means an unclean shutdown loses at most
+        one interval of backscroll instead of everything since the last clean
+        disconnect (which, in practice, never happened -- so the backlog grew for
+        days and replayed on every start)."""
+        try:
+            while True:
+                await asyncio.sleep(self.READ_FLUSH_INTERVAL)
+                # Dedupe by (network, identifier): read positions are keyed that
+                # way, so two sockets sharing an identifier need only one flush.
+                seen: set[tuple[str, str]] = set()
+                any_connected = False
+                for dss in list(self.downstreams.values()):
+                    for ds in list(dss):
+                        if not ds.network or not ds.identifier:
+                            continue
+                        any_connected = True
+                        key = (ds.network, ds.identifier)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        try:
+                            await self._update_read_positions(ds)
+                        except Exception:
+                            logger.exception(
+                                "Error flushing read positions for %s/%s",
+                                ds.network, ds.identifier)
+                if not any_connected:
+                    # No clients attached -- stop; attach_downstream restarts us.
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._read_flush_task = None
 
     async def _send_welcome(self, ds: DownstreamConnection, upstream: UpstreamConnection) -> None:
         """Send IRC welcome sequence to downstream client."""
@@ -424,13 +505,29 @@ class User:
             source=self.server_name,
         ))
 
+    # Messages replayed for a target this client identifier has never been
+    # synced against (no read_positions row). See Database.get_replay_start_id.
+    INITIAL_REPLAY_LINES = 200
+
+    # Hard cap on messages replayed per target in a single attach. Anything
+    # beyond this stays unread and replays on the next attach rather than being
+    # silently skipped -- see the `capped` bookkeeping below.
+    REPLAY_LIMIT = 4096
+
     async def _replay_backscroll(
         self, ds: DownstreamConnection, network: str, identifier: str
-    ) -> None:
-        """Replay unread messages to a downstream client."""
+    ) -> dict[str, int]:
+        """Replay unread messages to a downstream client.
+
+        Returns a map of target -> highest replayed message id for targets whose
+        replay hit REPLAY_LIMIT. The caller must not advance those read positions
+        past the returned id, or the untransmitted remainder would be marked read
+        and lost.
+        """
         targets = await self.db.get_all_targets(self.username, network)
         has_batch = ds.cap.supports("batch")
         has_time = ds.cap.supports("server-time")
+        capped: dict[str, int] = {}
 
         batch_id = None
         if has_batch:
@@ -445,10 +542,24 @@ class User:
             read_pos = await self.db.get_read_position(
                 self.username, network, identifier, target
             )
-            after_id = read_pos or 0
+            if read_pos is None:
+                # No row at all: this identifier has never been synced against
+                # this target, so every stored message looks unread. Replaying
+                # from 0 would dump the whole archive for the target, which is
+                # what made a first-time PM partner (or a fresh identifier)
+                # replay thousands of lines. Bound it to a recent window.
+                after_id = await self.db.get_replay_start_id(
+                    self.username, network, target, self.INITIAL_REPLAY_LINES
+                )
+            else:
+                after_id = read_pos
             messages = await self.db.get_messages_after(
-                self.username, network, target, after_id
+                self.username, network, target, after_id, limit=self.REPLAY_LIMIT
             )
+            if len(messages) >= self.REPLAY_LIMIT:
+                # Truncated. Remember where we actually stopped so the caller
+                # doesn't mark the untransmitted tail as read.
+                capped[target.lower()] = messages[-1][0]
             logger.debug("Replay %s/%s/%s/%s: read_pos=%s, after_id=%d, found=%d msgs",
                          self.username, network, identifier, target,
                          read_pos, after_id, len(messages))
@@ -483,6 +594,8 @@ class User:
 
         if replayed > 0:
             self.deliver_bouncer_message(ds, f"Replayed {replayed} messages")
+
+        return capped
 
     async def _replay_activity(
         self, ds: DownstreamConnection, network: str, identifier: str,

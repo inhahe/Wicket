@@ -131,6 +131,30 @@ class Database:
         )
         return await cursor.fetchall()
 
+    async def get_replay_start_id(
+        self, user: str, network: str, target: str, max_lines: int
+    ) -> int:
+        """Return an `after_id` that yields at most `max_lines` recent messages.
+
+        Used when a client identifier has no stored read position for a target.
+        A missing position is not the same as position 0: it means this client
+        has never been synced against this target at all, so there is no
+        meaningful "unread" boundary. Replaying from 0 would dump the entire
+        stored archive for that target, so bound it to a recent window instead.
+
+        Returns the id of the (max_lines + 1)-th newest message, or 0 when the
+        target has at most `max_lines` messages stored (replay everything).
+        """
+        assert self._conn
+        target = target.lower()
+        cursor = await self._conn.execute(
+            "SELECT id FROM messages WHERE user=? AND network=? AND target=? "
+            "ORDER BY id DESC LIMIT 1 OFFSET ?",
+            (user, network, target, max_lines),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
     async def get_messages_between(
         self,
         user: str,
