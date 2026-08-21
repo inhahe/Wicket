@@ -33,10 +33,18 @@ UPSTREAM_CAPS_WANTED = {
     "chghost",
 }
 
-# Capabilities the bouncer advertises to downstream clients
+# Capabilities the bouncer advertises to downstream clients.
+#
+# echo-message is deliberately NOT in UPSTREAM_REQUIRED_CAPS: Wicket can honour
+# it regardless of what the network supports. If the upstream echoes, that copy
+# is relayed; if it doesn't, Wicket echoes back the copy it constructs at send
+# time. Either way the client sees exactly one copy of its own message and can
+# turn off local echo -- which is the only way a multi-device client can tell
+# "I sent this here" from "I sent this from my other device".
 DOWNSTREAM_CAPS_AVAILABLE = {
     "message-tags",
     "server-time",
+    "echo-message",
     "away-notify",
     "account-notify",
     "extended-join",

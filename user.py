@@ -5,7 +5,7 @@ import asyncio
 import collections
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Optional
 
 from irc_parser import IRCMessage
@@ -142,6 +142,27 @@ for _cmd, (_replies, _ends, _errors) in ROUTED_REPLIES.items():
 
 
 @dataclass
+class PendingEcho:
+    """A message a client sent, awaiting the upstream's echo-message copy.
+
+    On a network with echo-message the echo is the authoritative copy: it
+    carries the server's msgid and server-time, and it is what every other
+    network participant saw. Wicket therefore stores *only* the echo, and this
+    records what to expect so the echo can be matched back to its sender.
+
+    `message` is Wicket's own reconstruction of the line, used as a fallback if
+    the echo never arrives, so a dropped echo costs a little latency rather
+    than the message's place in history.
+    """
+
+    target: str  # lowercased
+    text: str
+    message: IRCMessage
+    sender: Optional["DownstreamConnection"]
+    created_at: float
+
+
+@dataclass
 class ChannelState:
     name: str
     topic: Optional[str] = None
@@ -164,9 +185,15 @@ class User:
         self.channels: dict[str, dict[str, ChannelState]] = {}  # network -> {channel -> state}
         self.downstreams: dict[str, list[DownstreamConnection]] = {}  # network -> [downstream]
         self._pending_keys: dict[str, dict[str, str]] = {}  # network -> {channel_lower -> key}
-        # Echo suppression: when we forward our own message to other clients,
-        # suppress the upstream echo so the sender doesn't see a duplicate.
-        self._echo_suppress: dict[int, int] = {}  # id(ds) -> count
+        # Messages a client sent that we are waiting for the upstream to echo
+        # back (networks with echo-message). We deliberately do not store or
+        # forward at send time on those networks -- the echo is the single
+        # authoritative copy, carrying the server's msgid and server-time.
+        # Storing both is what made every own message appear twice.
+        #
+        # The sender is remembered only so the echo can be withheld from a
+        # client that did its own local echo (i.e. one without echo-message).
+        self._pending_echoes: dict[str, collections.deque[PendingEcho]] = {}
 
         # Reply routing: maps network -> deque of (downstream, command, reply_nums, end_nums, error_nums, created_at)
         # Uses a deque so we process in FIFO order (oldest pending route first).
@@ -287,6 +314,13 @@ class User:
             await self._update_read_positions(ds, capped=capped)
         except Exception:
             logger.exception("Error marking replay read for %s/%s", self.username, network)
+        # Ask for confirmation of everything just replayed. Until the PONG comes
+        # back nothing is marked read, so a client that dies mid-replay gets the
+        # same backscroll again rather than losing it.
+        try:
+            await ds.send_confirm_ping()
+        except Exception:
+            logger.exception("Error pinging %s/%s after replay", self.username, network)
         # Keep read positions current for the life of this connection so an
         # unclean shutdown loses at most one flush interval, not days.
         self._ensure_read_flush_task()
@@ -302,8 +336,9 @@ class User:
                 pass
 
 
-        # Clean up echo suppression counter
-        self._echo_suppress.pop(id(ds), None)
+        # Messages this client sent may still be awaiting their echo. Keep
+        # them -- they still have to be stored -- but forget the sender.
+        self._forget_pending_echoes(ds)
 
         # Update read positions for all targets
         if ds.network and ds.identifier:
@@ -312,34 +347,81 @@ class User:
             except Exception:
                 logger.exception("Error updating read positions for %s", ds.nick)
 
+    def _confirmed_watermark(
+        self, network: str, identifier: str, including: DownstreamConnection
+    ) -> int:
+        """Lowest confirmed-delivery id across every socket sharing an identifier.
+
+        Read positions are keyed by identifier, not by socket, so a position may
+        only advance as far as the least caught-up socket using that identifier.
+        Taking the maximum would mark messages read for a second, lagging client
+        that never received them.
+        """
+        watermarks = [
+            other.confirmed_id
+            for other in self.downstreams.get(network, [])
+            if other.identifier == identifier
+        ]
+        if including not in self.downstreams.get(network, []):
+            # Detaching client: already removed from the list, still counts.
+            watermarks.append(including.confirmed_id)
+        return min(watermarks) if watermarks else 0
+
     async def _update_read_positions(
         self, ds: DownstreamConnection, capped: dict[str, int] | None = None
     ) -> None:
-        """Update read positions for all targets when a client disconnects.
+        """Persist read positions as far as the client has *confirmed* delivery.
+
+        This deliberately does not use the latest stored id. Being attached is
+        not evidence of receipt: a phone that loses its network keeps a socket
+        that accepts writes for minutes before the OS reports the failure, and
+        everything written into it in the meantime is lost. Advancing to the
+        latest id on a timer marked those messages read, so they were never
+        replayed and were gone for good.
+
+        `ds.confirmed_id` only moves when a PONG proves the client parsed past
+        that point, so anything unacknowledged stays unread and replays on the
+        next attach.
 
         `capped` maps target -> highest id actually delivered for targets whose
-        attach-time replay was truncated at REPLAY_LIMIT. Those must not be
-        advanced to the latest stored id, or the tail we never sent would be
-        marked read and never replayed.
+        attach-time replay was truncated at REPLAY_LIMIT.
         """
         network = ds.network
         if not network:
             return
 
+        confirmed = self._confirmed_watermark(network, ds.identifier, ds)
+        if confirmed <= 0:
+            # Nothing confirmed yet (client just attached and has not answered a
+            # ping). Writing anything here would be a guess.
+            logger.debug("No confirmed delivery yet for %s/%s/%s; not advancing",
+                         self.username, network, ds.identifier)
+            return
+
         targets = await self.db.get_all_targets(self.username, network)
-        logger.debug("Saving read positions for %s/%s/%s: %d targets",
-                      self.username, network, ds.identifier, len(targets))
+        logger.debug("Saving read positions for %s/%s/%s: %d targets (confirmed=%d)",
+                      self.username, network, ds.identifier, len(targets), confirmed)
         for target in targets:
+            latest = await self.db.get_latest_message_id(self.username, network, target)
+            if latest is None:
+                continue
+            # Ids are globally ordered, so anything stored for this target at or
+            # below the confirmed watermark reached the client.
+            new_pos = min(latest, confirmed)
             if capped and target.lower() in capped:
-                latest = capped[target.lower()]
-            else:
-                latest = await self.db.get_latest_message_id(self.username, network, target)
-            if latest is not None:
-                await self.db.set_read_position(
-                    self.username, network, ds.identifier, target, latest
-                )
-                logger.debug("  read position %s/%s/%s/%s = %d",
-                             self.username, network, ds.identifier, target, latest)
+                new_pos = min(new_pos, capped[target.lower()])
+            if new_pos <= 0:
+                continue
+            existing = await self.db.get_read_position(
+                self.username, network, ds.identifier, target
+            )
+            if existing is not None and new_pos <= existing:
+                continue  # never move a read position backwards
+            await self.db.set_read_position(
+                self.username, network, ds.identifier, target, new_pos
+            )
+            logger.debug("  read position %s/%s/%s/%s = %d",
+                         self.username, network, ds.identifier, target, new_pos)
 
     # How often to persist read positions for connected clients (seconds). This
     # bounds how much backlog can replay after an unclean shutdown (e.g. a system
@@ -354,15 +436,25 @@ class User:
     async def _read_flush_loop(self) -> None:
         """Periodically persist read positions for every connected downstream.
 
-        A connected client has, by definition, received every message forwarded
-        since it attached, so its read position is simply the latest stored id per
-        target. Persisting that on a timer means an unclean shutdown loses at most
-        one interval of backscroll instead of everything since the last clean
-        disconnect (which, in practice, never happened -- so the backlog grew for
-        days and replayed on every start)."""
+        Persisting on a timer means an unclean shutdown loses at most one
+        interval of backscroll instead of everything since the last clean
+        disconnect (which, in practice, never happened -- so the backlog grew
+        for days and replayed on every start).
+
+        Note what this loop must NOT do: assume that being attached means the
+        client received anything. It once advanced every target to the latest
+        stored id, which silently consumed messages written into sockets that
+        were already dead. _update_read_positions now advances only to the
+        PONG-confirmed watermark; this loop just drives the flush."""
         try:
             while True:
                 await asyncio.sleep(self.READ_FLUSH_INTERVAL)
+                # Piggyback the echo-timeout sweep: a message whose echo never
+                # came back has to be stored eventually or it is lost.
+                try:
+                    await self._expire_pending_echoes()
+                except Exception:
+                    logger.exception("Error expiring pending echoes for %s", self.username)
                 # Dedupe by (network, identifier): read positions are keyed that
                 # way, so two sockets sharing an identifier need only one flush.
                 seen: set[tuple[str, str]] = set()
@@ -382,8 +474,12 @@ class User:
                             logger.exception(
                                 "Error flushing read positions for %s/%s",
                                 ds.network, ds.identifier)
-                if not any_connected:
-                    # No clients attached -- stop; attach_downstream restarts us.
+                if not any_connected and not any(self._pending_echoes.values()):
+                    # No clients attached and nothing owed to the database --
+                    # stop; attach_downstream restarts us. Messages still
+                    # waiting on an echo keep the loop alive, because they are
+                    # unstored: dropping the loop here would lose them if no
+                    # client ever reattached.
                     break
         except asyncio.CancelledError:
             pass
@@ -584,6 +680,7 @@ class User:
                     replay_msg.tags["batch"] = batch_id
 
                 await ds.send(replay_msg)
+                ds.note_written(msg_id)
                 replayed += 1
 
         if batch_id:
@@ -715,6 +812,8 @@ class User:
         if "time" in msg.tags and isinstance(msg.tags["time"], str):
             ts = self._parse_server_time(msg.tags["time"]) or ts
 
+        stored_id: int | None = None
+
         if cmd in ("PRIVMSG", "NOTICE") and msg.params:
             target = msg.params[0]
             # For PMs directed at us, store under the sender's nick
@@ -723,17 +822,17 @@ class User:
                     sender = IRCMessage.parse_prefix(msg.source)[0]
                     if sender.lower() != upstream.nick.lower():
                         target = sender
-            await self.db.store_message(self.username, network, target, msg, ts)
+            stored_id = await self.db.store_message(self.username, network, target, msg, ts)
 
         elif cmd in ("JOIN", "PART", "KICK", "MODE", "TOPIC") and msg.params:
             # Channel events — store under the channel
             target = msg.params[0]
             if self._is_channel(target):
-                await self.db.store_message(self.username, network, target, msg, ts)
+                stored_id = await self.db.store_message(self.username, network, target, msg, ts)
 
         elif cmd in ("QUIT", "NICK") and msg.source:
             # QUIT and NICK are global (no channel) — store once under "*"
-            await self.db.store_message(self.username, network, "*", msg, ts)
+            stored_id = await self.db.store_message(self.username, network, "*", msg, ts)
 
         # Update channel state (after storing QUIT/NICK)
         await self._update_state(network, msg)
@@ -741,7 +840,7 @@ class User:
         # Check if this numeric should be routed to a specific client
         routed_ds = self._check_reply_route(network, cmd)
         if routed_ds is not None:
-            await self._forward_to_downstream(routed_ds, msg)
+            await self._forward_to_downstream(routed_ds, msg, stored_id)
             return
 
         # Forward to all connected downstreams
@@ -754,18 +853,129 @@ class User:
                 if sender.lower() == upstream.nick.lower():
                     is_echo = True
 
+            # An echo is our own message coming back. It goes to every client
+            # except, possibly, the one that typed it -- see _deliver_own_copy.
+            origin_ds = self._match_pending_echo(network, msg) if is_echo else None
+
             for ds in list(self.downstreams[network]):
                 if is_echo:
-                    ds_id = id(ds)
-                    count = self._echo_suppress.get(ds_id, 0)
-                    if count > 0:
-                        # We already forwarded this to other clients; suppress for sender
-                        self._echo_suppress[ds_id] = count - 1
-                        continue
-                await self._forward_to_downstream(ds, msg)
+                    await self._deliver_own_copy(ds, msg, stored_id, origin_ds)
+                else:
+                    await self._forward_to_downstream(ds, msg, stored_id)
 
-    async def _forward_to_downstream(self, ds: DownstreamConnection, msg: IRCMessage) -> None:
-        """Forward a message to a downstream, adjusting for its cap set."""
+    async def _deliver_own_copy(
+        self,
+        ds: DownstreamConnection,
+        msg: IRCMessage,
+        msg_id: int | None,
+        origin_ds: Optional[DownstreamConnection],
+    ) -> None:
+        """Hand one client a copy of a message we sent.
+
+        Every client gets it except the one that typed it *without* negotiating
+        echo-message -- that client already displayed the line itself, so a
+        second copy would read as a duplicate. A client that did negotiate
+        echo-message has turned its local echo off and is relying on us.
+
+        The withheld case still advances the delivery watermark: the client has
+        the message, just not from us, and leaving the id unconfirmed would
+        stall its read position on a message it is never going to be sent.
+        """
+        if ds is origin_ds and not ds.cap.supports("echo-message"):
+            ds.note_written(msg_id)
+            return
+        await self._forward_to_downstream(ds, msg, msg_id)
+
+    # How long a sent message waits for its echo before Wicket stores its own
+    # reconstruction instead. Generous, because the round trip includes the
+    # upstream rate limiter's queue, which can be seconds deep during a flood.
+    ECHO_WAIT_SECS = 60
+
+    def _register_pending_echo(
+        self, ds: DownstreamConnection, network: str, target: str,
+        text: str, our_msg: IRCMessage,
+    ) -> None:
+        """Note that we expect the upstream to echo this message back."""
+        pending = self._pending_echoes.setdefault(network, collections.deque())
+        pending.append(PendingEcho(
+            target=target.lower(), text=text, message=our_msg,
+            sender=ds, created_at=time.time(),
+        ))
+
+    def _match_pending_echo(
+        self, network: str, msg: IRCMessage
+    ) -> Optional[DownstreamConnection]:
+        """Find which client sent the message this echo is a copy of.
+
+        Matching is on target plus exact text, oldest first. That is the only
+        handle we have: the echo comes back with the server's own tags, and
+        nothing in it identifies which of our attached clients typed it.
+        Returns None when nothing matches -- including the ordinary case of a
+        network without echo-message, where we register no expectations and the
+        "echo" is really some other message from our own nick.
+        """
+        pending = self._pending_echoes.get(network)
+        if not pending or len(msg.params) < 2:
+            return None
+        target = msg.params[0].lower()
+        text = msg.params[1]
+        for i, entry in enumerate(pending):
+            if entry.target == target and entry.text == text:
+                del pending[i]
+                return entry.sender
+        return None
+
+    async def _expire_pending_echoes(self) -> None:
+        """Store messages whose echo never came back.
+
+        Without this, a message the upstream silently dropped (or echoed in a
+        form we failed to match) would be missing from history entirely --
+        worse than the duplicate this whole mechanism exists to remove. So
+        after ECHO_WAIT_SECS we fall back to the behaviour used on networks
+        without echo-message: store our own reconstruction and deliver it.
+        """
+        cutoff = time.time() - self.ECHO_WAIT_SECS
+        for network, pending in list(self._pending_echoes.items()):
+            while pending and pending[0].created_at < cutoff:
+                entry = pending.popleft()
+                logger.warning(
+                    "No echo from %s for our %s after %ds; storing our own copy",
+                    network, entry.target, self.ECHO_WAIT_SECS,
+                )
+                try:
+                    msg_id = await self.db.store_message(
+                        self.username, network, entry.target, entry.message,
+                        entry.created_at,
+                    )
+                except Exception:
+                    logger.exception("Error storing unechoed message for %s", network)
+                    continue
+                for ds in list(self.downstreams.get(network, [])):
+                    await self._deliver_own_copy(ds, entry.message, msg_id, entry.sender)
+            if not pending:
+                self._pending_echoes.pop(network, None)
+
+    def _forget_pending_echoes(self, ds: DownstreamConnection) -> None:
+        """Drop a detaching client's claim on its pending echoes.
+
+        The entries stay -- the messages were still sent and still need storing
+        when the echo arrives -- but with no sender, so the echo is delivered to
+        everyone rather than withheld from a socket that no longer exists.
+        """
+        for pending in self._pending_echoes.values():
+            for i, entry in enumerate(pending):
+                if entry.sender is ds:
+                    pending[i] = replace(entry, sender=None)
+
+    async def _forward_to_downstream(
+        self, ds: DownstreamConnection, msg: IRCMessage, msg_id: int | None = None
+    ) -> None:
+        """Forward a message to a downstream, adjusting for its cap set.
+
+        `msg_id` is the stored message's row id, when it has one. It records a
+        delivery watermark on the connection so read positions can later be
+        advanced only as far as the client actually confirmed.
+        """
         # Track nick changes for this client
         if msg.command == "NICK" and msg.source and msg.params:
             old_nick = IRCMessage.parse_prefix(msg.source)[0]
@@ -801,6 +1011,7 @@ class User:
 
         try:
             await ds.send(forward)
+            ds.note_written(msg_id)
         except (ConnectionError, OSError):
             pass
         except Exception:
@@ -1002,40 +1213,35 @@ class User:
             self.deliver_bouncer_message(ds, f"Not connected to {ds.network}")
             return
 
-        # Store our own messages and forward to other clients
+        # Record our own messages so every device sees them, not just the one
+        # they were typed on.
         if cmd in ("PRIVMSG", "NOTICE") and msg.params:
             target = msg.params[0]
+            text = msg.params[1] if len(msg.params) > 1 else ""
             # Create a message that looks like it's from us
             our_msg = msg.copy(source=f"{upstream.nick}!{upstream.username}@{self.server_name}")
-            await self.db.store_message(self.username, ds.network, target, our_msg)
 
-            # Forward to other downstream clients so they see our messages
-            if ds.network in self.downstreams:
-                for other_ds in self.downstreams[ds.network]:
-                    if other_ds is not ds:
-                        await self._forward_to_downstream(other_ds, our_msg)
+            if upstream.cap.supports("echo-message"):
+                # The upstream will send this back with its own msgid and
+                # server-time, and that copy is what everyone else on the
+                # network saw. Wait for it rather than storing a second,
+                # slightly-different copy of the same line -- doing both is
+                # what made every message you sent appear twice in backscroll.
+                self._register_pending_echo(ds, ds.network, target, text, our_msg)
+            else:
+                # No echo is coming, so our reconstruction is the only copy
+                # there will ever be. Store and deliver it now.
+                own_id = await self.db.store_message(
+                    self.username, ds.network, target, our_msg
+                )
+                for other_ds in list(self.downstreams.get(ds.network, [])):
+                    await self._deliver_own_copy(other_ds, our_msg, own_id, ds)
 
-            # If upstream has echo-message, it will echo this PRIVMSG back
-            # to us.  Suppress that echo for ALL connected clients: the
-            # sender's client already displayed it locally (we don't
-            # advertise echo-message downstream), and other clients already
-            # received it via the forward above.
-            if upstream and upstream.cap.supports("echo-message"):
-                if ds.network in self.downstreams:
-                    for suppress_ds in self.downstreams[ds.network]:
-                        sid = id(suppress_ds)
-                        self._echo_suppress[sid] = self._echo_suppress.get(sid, 0) + 1
-
-        # PING - handle locally
-        if cmd == "PING":
-            await ds.send(IRCMessage(
-                command="PONG", params=msg.params, source=self.server_name,
-            ))
-            return
-
-        # PONG - don't forward
-        if cmd == "PONG":
-            return
+        # PING/PONG are handled in DownstreamConnection._handle_message, before
+        # routing gets here. They must be, because this function returns early
+        # with "Not connected to <network>" when the upstream is down, which
+        # would answer a client's keepalive with an error and drop the PONG that
+        # advances the delivery watermark.
 
         # JOIN - remember keys so we can persist them when upstream confirms
         if cmd == "JOIN" and msg.params:
@@ -1104,17 +1310,15 @@ class User:
                                          "ACTIVITY [channel|bouncer] [#chan1 #chan2 ...]")
         elif cmd == "STATUS":
             for net_name, up in self.upstreams.items():
-                status = "connected" if up.connected and up.registered else "disconnected"
                 n_clients = len(self.downstreams.get(net_name, []))
                 self.deliver_bouncer_message(
-                    ds, f"  {net_name}: {status} ({n_clients} clients)"
+                    ds, f"  {net_name}: {self._network_state(up)} ({n_clients} clients)"
                 )
         elif cmd == "LISTNETWORKS":
             for net_name in self.config.networks:
-                connected = net_name in self.upstreams and self.upstreams[net_name].connected
-                self.deliver_bouncer_message(
-                    ds, f"  {net_name}: {'connected' if connected else 'not connected'}"
-                )
+                up = self.upstreams.get(net_name)
+                state = self._network_state(up) if up else "not configured"
+                self.deliver_bouncer_message(ds, f"  {net_name}: {state}")
         elif cmd == "CONNECT":
             await self._handle_connect(ds, parts[1:])
         elif cmd == "DISCONNECT":
@@ -1127,6 +1331,24 @@ class User:
             await self._handle_activity(ds, parts[1:])
         else:
             self.deliver_bouncer_message(ds, f"Unknown command: {cmd}")
+
+    @staticmethod
+    def _network_state(upstream: "UpstreamConnection") -> str:
+        """One-word state for STATUS / LISTNETWORKS.
+
+        "disconnected" alone can't be acted on: it covers both a network that
+        is about to retry on its own and one that has been told to stay down,
+        and those want opposite things from the user.
+        """
+        if upstream.connected and upstream.registered:
+            return "connected"
+        if upstream.connected:
+            return "registering"
+        if upstream.reconnect_pending:
+            return "reconnecting"
+        if not upstream.reconnect_enabled:
+            return "disconnected (staying down)"
+        return "disconnected"
 
     async def _handle_connect(self, ds: DownstreamConnection, args: list[str]) -> None:
         """Handle the CONNECT bouncer command."""
@@ -1169,12 +1391,28 @@ class User:
             self.deliver_bouncer_message(ds, f"Unknown network '{net_name}'. Available: {available}")
             return
         upstream = self.upstreams[net_name]
-        if not upstream.connected:
-            self.deliver_bouncer_message(ds, f"Not connected to {net_name}")
+        # DISCONNECT means "stay down", so it must work while the network is
+        # DOWN and retrying -- which is the state you are in when you most want
+        # to stop it. This used to bail out with "Not connected" whenever
+        # `connected` was False, i.e. throughout every reconnect backoff, so a
+        # network in a retry loop could not be stopped at all.
+        if upstream.connected:
+            self.deliver_bouncer_message(ds, f"Disconnecting from {net_name}...")
+        elif upstream.reconnect_pending:
+            self.deliver_bouncer_message(ds, f"Cancelling reconnection to {net_name}...")
+        elif not upstream.reconnect_enabled:
+            self.deliver_bouncer_message(ds, f"Already disconnected from {net_name}")
             return
-        self.deliver_bouncer_message(ds, f"Disconnecting from {net_name}...")
+        else:
+            self.deliver_bouncer_message(ds, f"Not connected to {net_name}; disabling reconnection")
         await upstream.disconnect("Disconnected by user")
-        self.deliver_bouncer_message(ds, f"Disconnected from {net_name}")
+        self.deliver_bouncer_message(
+            ds,
+            f"Disconnected from {net_name}. It will stay down until you send "
+            f"CONNECT {net_name}, or until Wicket restarts -- set "
+            f"auto_connect: false for {net_name} in config.yaml to keep it down "
+            f"across restarts.",
+        )
 
     async def _handle_set_password(self, ds: DownstreamConnection, args: list[str]) -> None:
         """Handle the SETPASSWORD bouncer command."""

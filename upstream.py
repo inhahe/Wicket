@@ -115,6 +115,22 @@ class UpstreamConnection:
         # creating zombie connections that are never cleaned up.
         self._connecting: bool = False
 
+    @property
+    def reconnect_pending(self) -> bool:
+        """True if a reconnect attempt is scheduled or currently running.
+
+        Distinguishes "down and about to come back" from "down and staying
+        down", which is not visible from `connected` alone: both are False
+        there, and the difference is the whole point of DISCONNECT.
+        """
+        return (self._reconnect_task is not None and not self._reconnect_task.done()) \
+            or self._connecting
+
+    @property
+    def reconnect_enabled(self) -> bool:
+        """True if a future failure would schedule another attempt."""
+        return self._should_reconnect
+
     async def connect(self) -> None:
         """Connect to the IRC server, trying each configured server in order."""
         if self._connecting:
@@ -166,6 +182,21 @@ class UpstreamConnection:
             except (OSError, ssl.SSLError) as e:
                 logger.warning("Connection failed to %s:%d: %s", sc.host, sc.port, e)
                 continue  # Try next server
+
+            # DISCONNECT may have arrived while we were dialing. Its cleanup ran
+            # before this socket existed, so without this check nothing tears it
+            # down and the network comes back up in spite of the command.
+            if not self._should_reconnect:
+                logger.info("Connect to %s aborted: disconnected while dialing",
+                            self.network_name)
+                try:
+                    self.writer.close()
+                    await self.writer.wait_closed()
+                except (ConnectionError, OSError):
+                    pass
+                self.reader = None
+                self.writer = None
+                return
 
             # Connected successfully (TCP level — registration may still fail)
             self._server_index = idx

@@ -45,11 +45,23 @@ class IdentServer:
         addrs = ", ".join(str(s.getsockname()) for s in self._server.sockets)
         logger.info("Ident server listening on %s", addrs)
 
+    # Bound on wait_closed(). Since Python 3.12.1 that waits for every in-flight
+    # handler as well as the listen socket, and a handler can be parked in
+    # writer.drain() against an ident client that has stopped reading. This runs
+    # on the shutdown path, where nothing may wait indefinitely.
+    _STOP_TIMEOUT = 2.0
+
     async def stop(self) -> None:
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
-            logger.info("Ident server stopped")
+            try:
+                await asyncio.wait_for(self._server.wait_closed(),
+                                       timeout=self._STOP_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("Ident server did not close within %.0fs; "
+                               "continuing shutdown", self._STOP_TIMEOUT)
+            else:
+                logger.info("Ident server stopped")
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

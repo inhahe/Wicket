@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 
 from irc_parser import IRCMessage
@@ -93,6 +94,24 @@ class DownstreamConnection:
         self._ping_task: Optional[asyncio.Task] = None
         self._last_activity: float = time.monotonic()
 
+        # Delivery watermark, used to persist read positions honestly.
+        #
+        # `last_written_id` is the highest stored message id we have handed to
+        # writer.write(). That is NOT proof of delivery: a phone that has lost
+        # its network keeps a socket that accepts writes for minutes before the
+        # OS gives up, so bytes written to it can vanish.
+        #
+        # `confirmed_id` is the highest id the client has provably consumed. IRC
+        # runs over a single ordered stream, so a client cannot parse our PING
+        # without having already parsed everything written before it -- the
+        # matching PONG therefore proves delivery of every message up to the
+        # watermark captured when that PING was sent. Read positions advance to
+        # `confirmed_id` and never past it.
+        self.last_written_id: int = 0
+        self.confirmed_id: int = 0
+        self._pending_pings: "OrderedDict[str, int]" = OrderedDict()
+        self._ping_seq: int = 0
+
     async def start(self) -> None:
         """Start handling this client connection."""
         peer = self.writer.get_extra_info("peername")
@@ -166,10 +185,12 @@ class DownstreamConnection:
                     )
                     await self._force_disconnect()
                     break
-                if idle >= self._PING_IDLE:
-                    await self.send(IRCMessage(
-                        command="PING", params=[self.bouncer.config.server_name],
-                    ))
+                # Ping when the client has gone quiet, and also whenever there is
+                # unconfirmed data outstanding -- the PONG is what lets the read
+                # position advance, so an active client still needs regular pings
+                # or its backlog would be replayed again on every reconnect.
+                if idle >= self._PING_IDLE or self.last_written_id > self.confirmed_id:
+                    await self.send_confirm_ping()
                     if self._closed:
                         # send() detected a dead socket.
                         await self._force_disconnect()
@@ -189,6 +210,54 @@ class DownstreamConnection:
             self.writer.close()
         except (OSError, ConnectionError):
             pass
+
+    # Most pings we keep awaiting a PONG for. Clients answer in order, so a
+    # handful is plenty; the cap just stops a silent client growing the dict.
+    _MAX_PENDING_PINGS = 8
+
+    def note_written(self, msg_id: int | None) -> None:
+        """Record that a stored message was written to this client's socket.
+
+        Only raises the watermark -- messages are written in id order per
+        target, but replay interleaves targets, so ids can arrive out of order.
+        """
+        if msg_id and msg_id > self.last_written_id:
+            self.last_written_id = msg_id
+
+    async def send_confirm_ping(self) -> None:
+        """Send a PING that, once answered, confirms delivery of everything
+        written so far.
+
+        The token carries no meaning beyond matching the reply; the guarantee
+        comes from stream ordering, not the token itself.
+        """
+        self._ping_seq += 1
+        token = f"wicket-{self._ping_seq}"
+        self._pending_pings[token] = self.last_written_id
+        while len(self._pending_pings) > self._MAX_PENDING_PINGS:
+            self._pending_pings.popitem(last=False)
+        await self.send(IRCMessage(command="PING", params=[token]))
+
+    def handle_pong(self, msg: IRCMessage) -> None:
+        """Promote the delivery watermark in response to a client PONG.
+
+        Everything written before the matching PING has necessarily been parsed
+        by the client, because it had to read past those bytes to see the PING.
+        """
+        if not self._pending_pings:
+            return
+        watermark: int | None = None
+        for param in msg.params:
+            if param in self._pending_pings:
+                watermark = self._pending_pings.pop(param)
+                break
+        if watermark is None:
+            # Some clients rewrite or drop the token (answering with the server
+            # name instead). Fall back to the oldest outstanding ping: it is the
+            # most conservative watermark still consistent with a reply.
+            _, watermark = self._pending_pings.popitem(last=False)
+        if watermark > self.confirmed_id:
+            self.confirmed_id = watermark
 
     async def send(self, msg: IRCMessage) -> None:
         """Send a message to this client."""
@@ -385,6 +454,22 @@ class DownstreamConnection:
             await self._handle_cap(msg)
             return
 
+        # PONG advances the delivery watermark. Handled here rather than in the
+        # user router because that path returns early with "Not connected to X"
+        # when the upstream is down, which would both spam the client and lose
+        # the confirmation exactly when replay correctness matters most.
+        if cmd == "PONG":
+            self.handle_pong(msg)
+            return
+
+        # PING is answered locally, for the same reason.
+        if cmd == "PING":
+            await self.send(IRCMessage(
+                command="PONG", params=msg.params,
+                source=self.bouncer.config.server_name,
+            ))
+            return
+
         # Route through user
         if self.user:
             await self.user.route_downstream_message(self, msg)
@@ -394,12 +479,36 @@ class DownstreamConnection:
             command="ERROR", params=[text],
         ))
 
+    # Longest we will wait for read positions to be persisted while tearing a
+    # client down. The detach path is a handful of small SQLite round-trips, so
+    # exceeding this means something is wedged -- and losing a read position
+    # (which costs one extra replay) is far better than wedging the teardown,
+    # which on 2026-08-21 held the whole bouncer open for nearly three minutes.
+    _DETACH_TIMEOUT = 4.0
+
     async def _on_disconnect(self) -> None:
         """Handle client disconnection."""
         # Always detach (save read positions), even if close() was already called
         if not self._detached and self.user:
             self._detached = True
-            await self.user.detach_downstream(self)
+            # Run the detach as a separate task waited on with a deadline.
+            # asyncio.wait (not wait_for) because wait_for cancels the inner
+            # coroutine and then re-awaits it, which hangs forever if that
+            # coroutine is itself stuck in something uncancellable -- exactly the
+            # failure this deadline exists to bound. asyncio.wait always returns
+            # when the timer fires, whatever the task is doing.
+            detach = asyncio.create_task(self.user.detach_downstream(self))
+            done, _pending = await asyncio.wait({detach}, timeout=self._DETACH_TIMEOUT)
+            if not done:
+                detach.cancel()  # best effort; deliberately not awaited
+                logger.warning(
+                    "Timed out saving read positions for %s@%s/%s; "
+                    "some messages may replay on the next attach",
+                    self.user.username, self.identifier, self.network or "?")
+            elif not detach.cancelled() and detach.exception() is not None:
+                logger.error("Error detaching %s@%s/%s: %s",
+                             self.user.username, self.identifier,
+                             self.network or "?", detach.exception())
             logger.info("Client disconnected: %s@%s/%s",
                         self.user.username, self.identifier, self.network)
 
@@ -407,8 +516,42 @@ class DownstreamConnection:
             return
         self._closed = True
 
-        if self._ping_task:
+        self.stop_ping()
+
+    def stop_ping(self) -> None:
+        """Cancel the keepalive loop. Idempotent, and safe to call from anywhere.
+
+        The ping task is created by the connection but owned by nobody else, so
+        without an explicit stop it outlives its client: after shutdown cancelled
+        the read loops on 2026-08-21 the ping loops kept PINGing dead sockets
+        every 30s until their own 180s reap timer fired.
+        """
+        if self._ping_task and not self._ping_task.done():
             self._ping_task.cancel()
+
+    def abort(self) -> None:
+        """Drop the socket immediately, without waiting for anything.
+
+        Unlike ``close()``, this never awaits. ``close()`` awaits
+        ``wait_closed()``, which on a half-open socket (a sleeping phone, a
+        dropped mobile connection) blocks until the OS finally gives up -- so it
+        is unusable on a shutdown path. ``transport.abort()`` sends an RST and
+        tears the transport down synchronously, which is also what unblocks a
+        ``reader.read()`` or ``drain()`` that cancellation alone did not reach.
+        """
+        self._closed = True
+        self.stop_ping()
+        try:
+            transport = self.writer.transport
+        except AttributeError:  # pragma: no cover - non-stream writer in tests
+            transport = None
+        try:
+            if transport is not None and hasattr(transport, "abort"):
+                transport.abort()
+            else:
+                self.writer.close()
+        except (OSError, ConnectionError):
+            pass
 
     async def close(self) -> None:
         """Close the connection."""
@@ -418,5 +561,4 @@ class DownstreamConnection:
             await self.writer.wait_closed()
         except (OSError, ConnectionError):
             pass
-        if self._ping_task:
-            self._ping_task.cancel()
+        self.stop_ping()

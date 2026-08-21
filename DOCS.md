@@ -140,24 +140,62 @@ has already been shown.
 If you connect with no identifier (`Bob/libera:...`), all such
 unidentified connections share the `*` slot.
 
-A device's read position advances as soon as messages are delivered to
-it, so it never re-sees the same backscroll:
+### What counts as "seen"
 
-- **Right after connecting**, once the backscroll (and any activity)
-  has been replayed, the read position is bumped to the latest message
-  ID — so that batch is not replayed again next time.
-- **While connected**, read positions are re-persisted on a timer
-  (every `READ_FLUSH_INTERVAL` seconds, default 30). A connected client
-  has received every message forwarded since it attached, so its read
-  position is simply the latest stored ID.
+A read position only advances to messages the client has **confirmed
+receiving** — not merely ones Wicket wrote to its socket.
+
+The distinction matters because a TCP socket does not fail when the
+peer disappears. A phone that walks out of cell range leaves a socket
+that keeps accepting writes for minutes before the OS finally reports
+the connection is gone. Anything written into that window vanishes.
+Wicket used to treat "attached" as "delivered", so those messages were
+marked read and never replayed — lost permanently.
+
+Confirmation rides on IRC's own stream ordering. A client cannot parse
+a `PING` without having first parsed everything written before it, so
+the matching `PONG` proves every earlier byte arrived and was
+processed. Wicket therefore:
+
+- Records a **delivery watermark** (the highest message ID written) on
+  each downstream socket as it forwards.
+- Sends a `PING` with a tracked token whenever there are unconfirmed
+  writes — immediately after a connect's replay, and from the existing
+  keepalive loop.
+- On the matching `PONG`, promotes the watermark captured at that
+  `PING` to **confirmed**. Messages written *after* the ping are not
+  covered by it and wait for the next round.
+
+Read positions are then persisted:
+
+- **Right after connecting**, once backscroll has been replayed and the
+  client has answered the follow-up ping.
+- **While connected**, on a timer (every `READ_FLUSH_INTERVAL` seconds,
+  default 30), advancing only as far as the confirmed watermark.
 - **On disconnect** (including unclean disconnects where the TCP socket
-  closes, and on `QUIT`), read positions are saved a final time.
+  closes, and on `QUIT`), saved a final time — again only to what was
+  confirmed, so anything in flight when the link died replays.
 
-The timer matters because read positions used to advance *only* on a
-clean disconnect. A system restart kills both the bouncer and the
-client before either can save, so the read position froze and the last
-several days of messages replayed on every start. Flushing on a timer
-bounds that loss to one interval.
+Two further rules keep this safe:
+
+- A read position **never moves backwards**. A reconnecting client
+  starts with a fresh, zeroed watermark; that must not un-read
+  messages an earlier session already confirmed.
+- When several sockets share one identifier, the **least caught-up**
+  one governs. They share a single read position, so advancing to the
+  fastest socket's watermark would mark messages read for a laggard
+  that never got them.
+
+A client that never answers a `PING` therefore never has its read
+position advanced: it keeps its whole backlog and receives it all on
+the next attach. Re-delivering a message is a nuisance; losing one is
+not recoverable.
+
+The timer matters separately, because read positions used to advance
+*only* on a clean disconnect. A system restart kills both the bouncer
+and the client before either can save, so the read position froze and
+the last several days of messages replayed on every start. Flushing on
+a timer bounds that loss to one interval.
 
 ### Targets a device has never seen
 
@@ -426,6 +464,28 @@ that didn't request `extended-join`).
 `upstream_caps` and `downstream_caps` are full overrides — set them
 to `null` (the default) to use Wicket's built-in defaults.
 
+### `echo-message` and your own messages
+
+Wicket offers `echo-message` to clients **whether or not the network
+supports it**. If the network echoes your message back, Wicket relays
+that copy (it carries the server's own timestamp and message id); if
+it doesn't, Wicket echoes back the copy it constructs when it sends
+your line upstream. Either way a client that requested the cap sees
+exactly one copy of everything it sends.
+
+This matters if you use more than one device. Without it, a client
+receiving a message from its own nick can't tell whether it's an echo
+of something it just typed — already on screen from local echo — or
+something you typed on your *other* device, which has never been shown
+and will be lost if it's discarded. Clients faced with that choice
+usually drop all of them, so messages sent from your desktop never
+appear on your phone, live or in backscroll.
+
+With `echo-message` negotiated the ambiguity is gone: turn off local
+echo in the client and display everything Wicket sends. Clients that
+don't request the cap behave as before — their own messages are not
+sent back to them.
+
 ---
 
 ## Rate limiting
@@ -522,7 +582,7 @@ configured `server_name` instead (most clients route this to the
 | `STATUS` | Show connection status and client count for each network |
 | `LISTNETWORKS` | List all configured networks and connection state |
 | `CONNECT <network>` | Connect (or reconnect) to a network |
-| `DISCONNECT <network>` | Cleanly disconnect from a network without stopping the bouncer |
+| `DISCONNECT <network>` | Disconnect from a network and stop reconnecting to it, without stopping the bouncer |
 | `SETPASSWORD <newpass>` | Change your password (bcrypt-hashed and saved to `config.yaml`) |
 | `REHASH` | Reload `config.yaml` from disk and apply safe changes |
 | `ACTIVITY [channel\|bouncer] [#chan ...]` | Replay recent JOIN/PART/KICK/MODE/NICK/QUIT from history. The first arg may be `channel` or `bouncer` to override `replay_activity_target` for this invocation. Remaining `#chan` args filter to those channels. |
@@ -530,6 +590,31 @@ configured `server_name` instead (most clients route this to the
 `CONNECT` is also how you bring up networks that have
 `auto_connect: false`, or networks you previously took down with
 `DISCONNECT`.
+
+### Taking a network offline
+
+`DISCONNECT <network>` means *stay down*, not merely *drop the current
+socket*: it cancels any reconnect already scheduled and stops the
+automatic-reconnect machinery, so the network stays offline until you
+send `CONNECT <network>`. It works whether the network is connected,
+mid-reconnect, or already down — in particular you can use it to stop a
+network that is stuck retrying against a ban or a dead server.
+
+**It lasts until Wicket restarts.** To keep a network offline across
+restarts, set `auto_connect: false` for it in `config.yaml` and
+`REHASH` — that both takes it down now and stops it coming back at
+startup:
+
+```yaml
+networks:
+  undernet:
+    auto_connect: false
+```
+
+`STATUS` and `LISTNETWORKS` distinguish the two kinds of "down":
+`reconnecting` means an attempt is scheduled or in flight, while
+`disconnected (staying down)` means nothing will happen until you say
+so.
 
 `SETPASSWORD` requires the new password to be at least 4 characters.
 The hash is stored both in memory and in the YAML file (preserving
@@ -549,7 +634,12 @@ changes without dropping connections.
 - Top-level cascading defaults
 - Per-user passwords, delivery, delivery_source
 - Per-network `rate_limit_ms` (live-applied to active connections)
-- Autojoin lists, `auto_connect`, capability lists
+- Autojoin lists, capability lists
+- `auto_connect` — applied **live**: turning it off disconnects the
+  network (and cancels any reconnect in progress); turning it on
+  connects a network that is currently down. Only an actual change to
+  the value acts, so an unrelated `REHASH` never revives a network you
+  took down by hand with `DISCONNECT`.
 - `replay_activity` and `replay_activity_target` settings
 - New users
 - New networks (auto-connected if configured)
@@ -588,7 +678,15 @@ the bouncer.
   fast without spamming connect/quit on IRC.
 - **Graceful shutdown.** On `SIGINT`/`SIGTERM`, Wicket disconnects
   upstreams with a `QUIT`, closes downstreams, flushes the database,
-  and exits within ~5 seconds.
+  and exits. Every stage has a deadline, so a client that has gone
+  away without closing its socket — a sleeping phone, a dropped
+  mobile connection — cannot hold the process open: Wicket gives such
+  a client a few seconds to save its read positions, then drops the
+  socket and carries on. Worst case is around 15 seconds; the normal
+  case is under one. If a client had to be dropped that way you will
+  see `client connection(s) did not shut down in 5s; aborting their
+  sockets` in the log, and that client may replay a little backscroll
+  on its next attach.
 - **Systemd:** a typical unit runs `python /opt/wicket/bouncer.py
   -c /etc/wicket/config.yaml` as a non-root user. Use
   `Restart=on-failure` and consider `AmbientCapabilities=CAP_NET_BIND_SERVICE`
@@ -623,12 +721,15 @@ automatically; if you still see this, make sure you're on a recent
 build.
 
 **Backscroll replays messages you've already seen** — Read positions
-advance right after each connect's replay and again on a timer while
-connected (see [Per-device backscroll](#per-device-backscroll)), so at
-most one flush interval (default 30s) of messages can replay after an
-unclean shutdown. If you see *more* than that replay repeatedly, check
-that the client connects with a stable `@identifier` (positions are
-keyed per identifier) and that Wicket has write access to its database.
+advance only as far as the client has confirmed with a `PONG`, and are
+persisted after each connect's replay and on a timer while connected
+(see [Per-device backscroll](#per-device-backscroll)), so at most one
+flush interval (default 30s) of messages can replay after an unclean
+shutdown. If you see the *same* backscroll every single time, the
+client is probably not answering Wicket's `PING`s — nothing is ever
+confirmed, so nothing is ever marked read. Otherwise check that the
+client connects with a stable `@identifier` (positions are keyed per
+identifier) and that Wicket has write access to its database.
 
 **Ident shows `~` prefix anyway** — Either ident isn't enabled,
 your ISP blocks port 113, or the IRC server didn't query in time.

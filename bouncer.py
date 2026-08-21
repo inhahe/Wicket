@@ -4,6 +4,7 @@
 from __future__ import annotations
 import argparse
 import asyncio
+import io
 import logging
 import logging.handlers
 import os
@@ -31,7 +32,16 @@ class Bouncer:
         self.users: dict[str, User] = {}
         self._server: Optional[asyncio.Server] = None
         self._downstream_tasks: set[asyncio.Task] = set()
+        # The connection objects behind those tasks. Cancelling a task is not
+        # enough to tear a client down -- only closing its socket reliably
+        # unblocks a pending read on a half-open connection -- and the task
+        # alone gives no handle on the socket, so track the objects too.
+        self._downstreams: set[DownstreamConnection] = set()
         self.ident_server: Optional[IdentServer] = None
+        # Set once shutdown starts; fires when it has finished. Doubles as the
+        # "already shutting down" flag so a second caller can wait rather than
+        # race ahead of the first.
+        self._shutdown_done: Optional[asyncio.Event] = None
 
     async def start(self) -> None:
         """Start the bouncer."""
@@ -118,7 +128,13 @@ class Bouncer:
         ds = DownstreamConnection(self, reader, writer)
         task = asyncio.create_task(ds.start())
         self._downstream_tasks.add(task)
-        task.add_done_callback(self._downstream_tasks.discard)
+        self._downstreams.add(ds)
+
+        def _finished(t: asyncio.Task, ds=ds) -> None:
+            self._downstream_tasks.discard(t)
+            self._downstreams.discard(ds)
+
+        task.add_done_callback(_finished)
 
     async def rehash(self, requesting_ds=None) -> list[str]:
         """Reload config from disk and apply safe changes.
@@ -239,7 +255,29 @@ class Bouncer:
                     messages.append(f"{uname}/{nname}: rate_limit_ms changed to {new_ncfg.rate_limit_ms}")
 
                 old_ncfg.autojoin = new_ncfg.autojoin
-                old_ncfg.auto_connect = new_ncfg.auto_connect
+
+                # auto_connect is applied live, not just remembered for the next
+                # startup. Turning it off is how you say "stay off undernet
+                # until further notice" in a way that survives a restart, and it
+                # would be useless if the network kept running (or kept
+                # retrying) until you happened to restart Wicket. Only an actual
+                # change acts, so an unrelated REHASH never disturbs a network
+                # you took down by hand with DISCONNECT.
+                if old_ncfg.auto_connect != new_ncfg.auto_connect:
+                    old_ncfg.auto_connect = new_ncfg.auto_connect
+                    upstream = user.upstreams.get(nname)
+                    if upstream is None:
+                        pass
+                    elif new_ncfg.auto_connect:
+                        if not upstream.connected and not upstream.reconnect_pending:
+                            upstream._should_reconnect = True
+                            asyncio.create_task(upstream.connect())
+                            messages.append(f"{uname}/{nname}: auto_connect enabled, connecting")
+                        else:
+                            messages.append(f"{uname}/{nname}: auto_connect enabled")
+                    else:
+                        await upstream.disconnect("auto_connect disabled")
+                        messages.append(f"{uname}/{nname}: auto_connect disabled, disconnected")
                 old_ncfg.caps_wanted = new_ncfg.caps_wanted
                 old_ncfg.upstream_caps = new_ncfg.upstream_caps
                 old_ncfg.downstream_caps = new_ncfg.downstream_caps
@@ -262,10 +300,25 @@ class Bouncer:
         return messages
 
     async def shutdown(self) -> None:
-        """Gracefully shut down the bouncer."""
-        if hasattr(self, '_shutting_down'):
+        """Gracefully shut down the bouncer.
+
+        Safe to call concurrently and repeatedly: on a signal the handler
+        schedules this as its own task, and ``run()``'s ``finally`` calls it
+        again once ``serve_forever()`` unwinds. A later caller *waits for* the
+        first run instead of returning early -- returning early let ``run()``
+        finish while shutdown was still in progress, and the process-level
+        cleanup would then cancel it before it had closed the database.
+        """
+        if self._shutdown_done is not None:
+            await self._shutdown_done.wait()
             return
-        self._shutting_down = True
+        self._shutdown_done = asyncio.Event()
+        try:
+            await self._shutdown()
+        finally:
+            self._shutdown_done.set()
+
+    async def _shutdown(self) -> None:
         logger.info("Shutting down...")
 
         # Stop accepting new connections
@@ -295,15 +348,86 @@ class Bouncer:
         if self.ident_server:
             await self.ident_server.stop()
 
-        # Cancel all downstream tasks and wait briefly
-        for task in self._downstream_tasks:
-            task.cancel()
-        if self._downstream_tasks:
-            await asyncio.gather(*self._downstream_tasks, return_exceptions=True)
+        # Disconnect downstream clients
+        await self._shutdown_downstreams()
 
         # Close database
         await self.db.close()
         logger.info("Shutdown complete")
+
+    # How long the graceful phase of downstream teardown gets: cancel the read
+    # loops and let each one save its read positions on the way out. Kept longer
+    # than DownstreamConnection._DETACH_TIMEOUT so that a client whose detach is
+    # merely slow -- rather than wedged -- still gets to finish, and so that one
+    # whose detach does hit its own ceiling unwinds inside this phase instead of
+    # having its socket yanked a moment before it would have succeeded.
+    DOWNSTREAM_TEARDOWN_TIMEOUT = 5.0
+    # And how long they get after their sockets have been aborted, for the read
+    # loop to notice the dead transport and unwind.
+    DOWNSTREAM_ABORT_TIMEOUT = 5.0
+
+    async def _shutdown_downstreams(self) -> None:
+        """Tear down every connected client, under a hard deadline.
+
+        Every step here is bounded on purpose. Cancelling a read loop does not
+        guarantee it finishes: its ``finally`` still runs ``_on_disconnect()``,
+        which persists read positions, and a client whose socket has gone
+        black-hole (a sleeping phone, a dropped mobile connection) can leave
+        that path -- or the pending ``reader.read()`` the cancel was aimed at --
+        stuck for minutes. The old code waited on a bare ``gather()`` with no
+        timeout, so on 2026-08-21 shutdown sat there for 2m45s and only finished
+        when each client's own 180s ping-reap timer closed its socket for it.
+        Shutdown must not depend on that timer, so nothing below waits forever.
+        """
+        # Stop the keepalive loops first. They are separate tasks that nothing
+        # else cancels, so otherwise they go on PINGing dead sockets for as long
+        # as the rest of the teardown takes.
+        for ds in list(self._downstreams):
+            ds.stop_ping()
+
+        for task in list(self._downstream_tasks):
+            task.cancel()
+        if not self._downstream_tasks:
+            return
+
+        pending = await self._wait_downstream_tasks(self.DOWNSTREAM_TEARDOWN_TIMEOUT)
+        if not pending:
+            return
+
+        logger.warning("%d client connection(s) did not shut down in %.0fs; "
+                       "aborting their sockets", len(pending),
+                       self.DOWNSTREAM_TEARDOWN_TIMEOUT)
+        for ds in list(self._downstreams):
+            ds.abort()
+
+        pending = await self._wait_downstream_tasks(self.DOWNSTREAM_ABORT_TIMEOUT)
+        if pending:
+            # Abandon them: they cannot block the rest of shutdown. Log where
+            # each one is stuck so the next occurrence diagnoses itself instead
+            # of needing another live post-mortem.
+            logger.warning("%d client connection(s) still stuck after abort; "
+                           "abandoning them", len(pending))
+            for task in pending:
+                buf = io.StringIO()
+                try:
+                    task.print_stack(limit=12, file=buf)
+                except Exception:  # pragma: no cover - diagnostics only
+                    continue
+                logger.warning("Stuck client task:\n%s", buf.getvalue())
+
+    async def _wait_downstream_tasks(self, timeout: float) -> set[asyncio.Task]:
+        """Wait up to `timeout` for the downstream tasks; return those still running.
+
+        Uses asyncio.wait rather than wait_for(gather(...)) because wait_for
+        cancels what it is waiting on and then re-awaits it, which never returns
+        if a task swallows CancelledError -- precisely the case this exists to
+        survive. asyncio.wait always returns when its timer fires.
+        """
+        tasks = set(self._downstream_tasks)
+        if not tasks:
+            return set()
+        _done, pending = await asyncio.wait(tasks, timeout=timeout)
+        return pending
 
 
 def _setup_logging(config: BouncerConfig, args) -> None:
