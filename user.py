@@ -399,29 +399,26 @@ class User:
             return
 
         targets = await self.db.get_all_targets(self.username, network)
-        logger.debug("Saving read positions for %s/%s/%s: %d targets (confirmed=%d)",
-                      self.username, network, ds.identifier, len(targets), confirmed)
+        # Ids are globally ordered, so for each target anything stored at or
+        # below the confirmed watermark reached the client. A target whose
+        # replay was truncated is held down further to what was actually sent.
+        limits = {}
         for target in targets:
-            latest = await self.db.get_latest_message_id(self.username, network, target)
-            if latest is None:
-                continue
-            # Ids are globally ordered, so anything stored for this target at or
-            # below the confirmed watermark reached the client.
-            new_pos = min(latest, confirmed)
+            limit = confirmed
             if capped and target.lower() in capped:
-                new_pos = min(new_pos, capped[target.lower()])
-            if new_pos <= 0:
-                continue
-            existing = await self.db.get_read_position(
-                self.username, network, ds.identifier, target
-            )
-            if existing is not None and new_pos <= existing:
-                continue  # never move a read position backwards
-            await self.db.set_read_position(
-                self.username, network, ds.identifier, target, new_pos
-            )
-            logger.debug("  read position %s/%s/%s/%s = %d",
-                         self.username, network, ds.identifier, target, new_pos)
+                limit = min(limit, capped[target.lower()])
+            if limit > 0:
+                limits[target] = limit
+        logger.debug("Saving read positions for %s/%s/%s: %d targets (confirmed=%d)",
+                      self.username, network, ds.identifier, len(limits), confirmed)
+        # Deliberately one bulk call rather than a loop of per-target queries:
+        # this runs on every attach, every detach, and every flush interval for
+        # every attached client, and every await here occupies aiosqlite's
+        # single worker thread to the exclusion of the whole process. The
+        # never-move-backwards rule is enforced inside the statement.
+        await self.db.advance_read_positions(
+            self.username, network, ds.identifier, limits
+        )
 
     # How often to persist read positions for connected clients (seconds). This
     # bounds how much backlog can replay after an unclean shutdown (e.g. a system

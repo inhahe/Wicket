@@ -731,6 +731,17 @@ confirmed, so nothing is ever marked read. Otherwise check that the
 client connects with a stable `@identifier` (positions are keyed per
 identifier) and that Wicket has write access to its database.
 
+**Wicket stops responding to everything for minutes at a time** — You
+type a bouncer command and get no reply, new clients connect but never
+finish logging in, and nothing appears in the log to explain it. This
+is the signature of a slow database query: Wicket runs every SQL
+statement on a single worker thread, so one slow query stalls every
+connection at once. A version before 2026-08-21 did this on databases
+with large history (see `bugs.txt`); upgrade. To confirm it on any
+build, set `logging.level: debug` and look for an `aiosqlite:
+executing …` line with a long gap before its matching `operation …
+completed` — that gap is how long the whole bouncer was frozen.
+
 **Ident shows `~` prefix anyway** — Either ident isn't enabled,
 your ISP blocks port 113, or the IRC server didn't query in time.
 Check Wicket's logs for ident activity.

@@ -112,6 +112,62 @@ class Database:
         )
         await self._conn.commit()
 
+    # One statement per target, but all of them submitted in a single
+    # executemany() -- see advance_read_positions for why that matters.
+    #
+    # Everything the old Python loop did is expressed here:
+    #   * MIN(MAX(id), :limit) is "as far as this target has been delivered",
+    #     where MAX(id) is one index seek to the last entry for the target;
+    #   * WHERE pos > 0 drops targets with nothing to record, which is also what
+    #     keeps the upsert clause unambiguous (SQLite requires a WHERE between a
+    #     SELECT data source and ON CONFLICT);
+    #   * the DO UPDATE ... WHERE enforces the never-move-backwards rule in SQL
+    #     instead of with a read-then-compare round trip, which also closes the
+    #     window where a concurrent flush could interleave between the two.
+    _ADVANCE_READ_POSITION_SQL = """
+        INSERT INTO read_positions (user, network, identifier, target, message_id)
+        SELECT :user, :network, :identifier, :target, p.pos FROM (
+            SELECT MIN(
+                (SELECT MAX(id) FROM messages
+                  WHERE user=:user AND network=:network AND target=:target),
+                :limit
+            ) AS pos
+        ) p
+        WHERE p.pos > 0
+        ON CONFLICT (user, network, identifier, target) DO UPDATE
+            SET message_id = excluded.message_id
+            WHERE excluded.message_id > read_positions.message_id
+    """
+
+    async def advance_read_positions(
+        self, user: str, network: str, identifier: str, limits: dict[str, int]
+    ) -> None:
+        """Advance many read positions at once, never backwards.
+
+        `limits` maps target -> the highest id that may be marked read for it
+        (the delivery watermark, lowered further for targets whose replay was
+        truncated). A target is advanced to the lower of that and its newest
+        stored message.
+
+        This exists as a bulk operation because aiosqlite runs the whole
+        process's queries on one worker thread: the previous version did three
+        awaits per target (latest id, current position, write) plus a commit
+        each, so a routine flush for one client was ~216 hops onto that thread
+        and 72 fsyncs, during which nothing else in the bouncer could touch the
+        database. Now it is one hop and one commit regardless of target count.
+        """
+        assert self._conn
+        rows = [
+            {"user": user, "network": network, "identifier": identifier,
+             "target": target.lower(), "limit": limit}
+            for target, limit in limits.items()
+            if limit > 0
+        ]
+        if not rows:
+            return
+        await self._conn.executemany(self._ADVANCE_READ_POSITION_SQL, rows)
+        await self._conn.commit()
+
     async def get_messages_after(
         self,
         user: str,
@@ -209,12 +265,35 @@ class Database:
             results = results[:limit]
         return results
 
+    # Emulates a loose index scan ("skip scan"). SQLite does not implement one,
+    # so the obvious `SELECT DISTINCT target FROM messages WHERE user=? AND
+    # network=?` walks EVERY index entry for that network to produce its handful
+    # of distinct targets -- 785,227 entries for 71 targets on a real database.
+    # Warm that is ~120ms; cold, on a live WAL database with concurrent writes,
+    # it took two to four MINUTES, during which aiosqlite's single worker thread
+    # is inside sqlite3 and every other query in the process is stuck behind it.
+    # That wedged client attaches and detaches (see bugs.txt 2026-08-21).
+    #
+    # This walks the distinct values instead: seek the first target, then
+    # repeatedly seek the next one greater than it. One index seek per distinct
+    # target -- 72 seeks instead of 785,227 entries -- and the cost stops
+    # depending on how much history is stored.
+    _DISTINCT_TARGETS_SQL = """
+        WITH RECURSIVE t(target) AS (
+            SELECT MIN(target) FROM messages WHERE user=:user AND network=:network
+            UNION ALL
+            SELECT (SELECT MIN(target) FROM messages
+                     WHERE user=:user AND network=:network AND target > t.target)
+            FROM t WHERE t.target IS NOT NULL
+        )
+        SELECT target FROM t WHERE target IS NOT NULL
+    """
+
     async def get_all_targets(self, user: str, network: str) -> list[str]:
         """Get all targets (channels/nicks) that have stored messages."""
         assert self._conn
         cursor = await self._conn.execute(
-            "SELECT DISTINCT target FROM messages WHERE user=? AND network=?",
-            (user, network),
+            self._DISTINCT_TARGETS_SQL, {"user": user, "network": network},
         )
         rows = await cursor.fetchall()
         return [r[0] for r in rows]
