@@ -99,7 +99,15 @@ class UpstreamConnection:
         # and an ERROR line) only counts as one ban.
         self._ban_noted_this_conn: bool = False
         self._sasl_mechanism: Optional[str] = None
-        self._should_reconnect: bool = True
+        # `auto_connect: false` means "stay down until I say otherwise", which
+        # is the same state DISCONNECT produces -- so start there rather than
+        # merely skipping the initial dial.  Starting True made the setting a
+        # one-shot: anything that called connect() (a client attaching, a
+        # failure handler) would find reconnects already enabled and drag the
+        # network back up, and any failure would arm a backoff timer for a
+        # network the user asked to leave alone.  It also made LISTNETWORKS
+        # report a plain "disconnected" for a network that was staying down.
+        self._should_reconnect: bool = network_config.auto_connect
 
         # Track pending SASL
         self._sasl_in_progress: bool = False

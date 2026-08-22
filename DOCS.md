@@ -614,7 +614,21 @@ networks:
 `STATUS` and `LISTNETWORKS` distinguish the two kinds of "down":
 `reconnecting` means an attempt is scheduled or in flight, while
 `disconnected (staying down)` means nothing will happen until you say
-so.
+so. A network with `auto_connect: false` reports `disconnected (staying
+down)` from startup, since that setting and `DISCONNECT` put it in the
+same state.
+
+**Attaching a client does not override either of them.** Normally,
+pointing a client at a network that happens to be down makes Wicket dial
+it — but not for a network you have deliberately taken down, and
+attaching never re-enables automatic reconnection. (Before 2026-08-22 it
+did both, so the first client to attach quietly undid `auto_connect:
+false` and every `DISCONNECT`.) When you attach to a network that is
+staying down, Wicket says so and leaves it alone:
+
+```
+Attached to undernet (upstream is not connected — use CONNECT undernet to connect)
+```
 
 `SETPASSWORD` requires the new password to be at least 4 characters.
 The hash is stored both in memory and in the YAML file (preserving

@@ -407,10 +407,21 @@ class DownstreamConnection:
             await self.close()
             return
 
-        # Kick off upstream connection in the background if not connected yet
+        # Kick off upstream connection in the background if not connected yet.
+        #
+        # Only for a network that is down incidentally, never for one that is
+        # down on purpose.  Attaching a client is not an instruction to change
+        # connection policy: `auto_connect: false` and an explicit DISCONNECT
+        # both clear reconnect_enabled, and honouring it here is what makes
+        # either of them stick.  (This used to dial unconditionally *and* force
+        # _should_reconnect back to True.  On 2026-08-21 a phone attached 7s
+        # after startup, dialled a network configured auto_connect: false,
+        # collected an "excessive connections" G-line, and -- because the dial
+        # had just re-armed the reconnect machinery -- scheduled a 25h retry
+        # that resurrected the network a day later.  See bugs.txt.)
         upstream = user.upstreams[network]
-        if not upstream.connected and not upstream.registered:
-            upstream._should_reconnect = True
+        if (not upstream.connected and not upstream.registered
+                and upstream.reconnect_enabled):
             self._connect_task = asyncio.create_task(upstream.connect())
             # Store reference so it doesn't get GC'd
             self._connect_task.add_done_callback(lambda t: None)
