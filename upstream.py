@@ -68,7 +68,13 @@ class UpstreamConnection:
 
         self.isupport: dict[str, str | None] = {}
         self.server_name: str = ""
+        # PREFIX=(ov)@+ -- the two halves, in matching order, so that a mode
+        # letter can be turned into the symbol it grants. Tracking the symbols
+        # alone is enough to *parse* a NAMES reply but not to apply a MODE.
+        self.prefix_modes: str = "ov"   # default, paired with nick_prefixes
         self.nick_prefixes: str = "@+"  # default
+        # CHANMODES=A,B,C,D -- needed to know which mode letters consume an
+        # argument, so the arguments line up with the letters that own them.
         self.chan_modes: str = ""
         self.casemapping: str = "rfc1459"
 
@@ -666,9 +672,20 @@ class UpstreamConnection:
 
         if "PREFIX" in self.isupport:
             val = self.isupport["PREFIX"]
-            if val and ")" in val:
-                # FORMAT: (ov)@+
-                self.nick_prefixes = val.split(")")[1]
+            if val and val.startswith("(") and ")" in val:
+                # FORMAT: (ov)@+ -- letters and symbols pair up by position.
+                modes, symbols = val[1:].split(")", 1)
+                if modes and symbols and len(modes) == len(symbols):
+                    self.prefix_modes = modes
+                    self.nick_prefixes = symbols
+                elif symbols:
+                    # Malformed, but the symbols are still usable for parsing
+                    # NAMES; leave the letters at their default rather than
+                    # pairing them up wrongly.
+                    self.nick_prefixes = symbols
+
+        if "CHANMODES" in self.isupport:
+            self.chan_modes = self.isupport["CHANMODES"] or ""
 
         if "CASEMAPPING" in self.isupport:
             self.casemapping = self.isupport["CASEMAPPING"] or "rfc1459"

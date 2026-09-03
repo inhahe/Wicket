@@ -162,6 +162,34 @@ class PendingEcho:
     created_at: float
 
 
+# Shortest echo we will accept as a truncation of what was sent. A server that
+# truncates cuts at the 512-byte line limit, so a real truncation keeps nearly
+# all of the text; requiring a healthy prefix stops a short, common line ("ok",
+# "yes") from being matched against an unrelated longer one that happens to
+# start the same way.
+_MIN_TRUNCATED_ECHO = 40
+
+
+def _echo_text_matches(sent: str, echoed: str) -> bool:
+    """Is `echoed` the server's copy of `sent`?
+
+    Equal after stripping trailing whitespace, or a prefix of it -- those are
+    the two normalisations a server is allowed to apply (see
+    `UserSession._match_pending_echo`). Deliberately one-directional: the echo
+    may be shorter than what we sent, never longer, so an unrelated *longer*
+    message that merely begins with a shorter one is not a match.
+    """
+    sent = sent.rstrip()
+    echoed = echoed.rstrip()
+    if sent == echoed:
+        return True
+    return (
+        len(echoed) >= _MIN_TRUNCATED_ECHO
+        and len(echoed) < len(sent)
+        and sent.startswith(echoed)
+    )
+
+
 @dataclass
 class ChannelState:
     name: str
@@ -904,12 +932,36 @@ class User:
     ) -> Optional[DownstreamConnection]:
         """Find which client sent the message this echo is a copy of.
 
-        Matching is on target plus exact text, oldest first. That is the only
-        handle we have: the echo comes back with the server's own tags, and
-        nothing in it identifies which of our attached clients typed it.
-        Returns None when nothing matches -- including the ordinary case of a
-        network without echo-message, where we register no expectations and the
-        "echo" is really some other message from our own nick.
+        Matching is on target plus text, oldest first. That is the only handle
+        we have: the echo comes back with the server's own tags, and nothing in
+        it identifies which of our attached clients typed it. Returns None when
+        nothing matches -- including the ordinary case of a network without
+        echo-message, where we register no expectations and the "echo" is really
+        some other message from our own nick.
+
+        **The comparison must not be byte-exact.** An echo is the *server's*
+        copy of the line, and the server is entitled to normalise it on the way
+        through; what comes back is what other participants saw, which is not
+        always what we sent. Two such transformations are routine, and both are
+        invisible in a log (a trailing space does not survive being read by eye,
+        which is why this took so long to find):
+
+          * **Trailing whitespace is stripped.** Libera does this. A message the
+            user ended with a space -- ". " at the end of a sentence, or the tail
+            chunk of a client-split long line -- comes back one character
+            shorter.
+          * **The line is truncated** to fit the 512-byte protocol limit, which
+            the server computes using its own idea of our full hostmask. A client
+            cannot know that length exactly, so it can only be conservative.
+
+        Failing to match is not a cosmetic miss. The sender is then unknown, so
+        `_deliver_echo` cannot withhold the echo from the client that typed the
+        line, and a client relying on its own local echo (i.e. one that did not
+        negotiate echo-message) draws the message a second time. It also strands
+        the pending entry until it expires, at which point `_expire_pending_echoes`
+        stores Wicket's reconstruction *alongside* the echo the upstream already
+        gave us -- so the message is doubled in history too, and doubled again in
+        every future backscroll replay.
         """
         pending = self._pending_echoes.get(network)
         if not pending or len(msg.params) < 2:
@@ -917,7 +969,7 @@ class User:
         target = msg.params[0].lower()
         text = msg.params[1]
         for i, entry in enumerate(pending):
-            if entry.target == target and entry.text == text:
+            if entry.target == target and _echo_text_matches(entry.text, text):
                 del pending[i]
                 return entry.sender
         return None
@@ -1035,6 +1087,70 @@ class User:
             return ds.cap.supports("message-tags")
         return True
 
+    @staticmethod
+    def _apply_member_modes(upstream, chan, modestr: str,
+                            args: list[str]) -> None:
+        """Apply one channel MODE change to *chan*.members prefixes.
+
+        Only the prefix modes (PREFIX=(ov)@+ -> "ov") change a member's symbol,
+        but every *other* mode letter still has to be walked, because the
+        arguments are positional: "+bo mask nick" gives the mask to +b and the
+        nick to +o, and a parser that skips +b hands the mask to +o. Which
+        letters consume an argument comes from CHANMODES=A,B,C,D -- A and B
+        always, C only when set, D never -- with a conservative default for a
+        server that does not advertise it.
+        """
+        modes = upstream.prefix_modes or ""
+        symbols = upstream.nick_prefixes or ""
+        parts = (upstream.chan_modes or "beI,k,l,imnpst").split(",")
+        while len(parts) < 4:
+            parts.append("")
+        list_modes, arg_always, arg_on_set = parts[0], parts[1], parts[2]
+
+        adding = True
+        argi = 0
+        for ch in modestr:
+            if ch == "+":
+                adding = True
+                continue
+            if ch == "-":
+                adding = False
+                continue
+            takes_arg = (ch in modes or ch in list_modes or ch in arg_always
+                         or (adding and ch in arg_on_set))
+            arg = None
+            if takes_arg:
+                if argi < len(args):
+                    arg = args[argi]
+                # Consumed even when absent: a malformed line must not shift
+                # every later argument onto the wrong mode.
+                argi += 1
+            if arg is None or ch not in modes:
+                continue
+            idx = modes.index(ch)
+            if idx >= len(symbols):
+                continue
+            sym = symbols[idx]
+            # Case-insensitively, because a MODE may spell a nick differently
+            # from the NAMES that created the entry, and the key here is the
+            # server's spelling.
+            target = next((m for m in chan.members if m.lower() == arg.lower()),
+                          None)
+            if target is None:
+                continue
+            cur = chan.members.get(target, "")
+            if adding:
+                if sym not in cur:
+                    cur += sym
+            else:
+                cur = cur.replace(sym, "")
+            # Highest-ranking symbol first, in the server's own PREFIX order,
+            # so a client that reads only the first character gets the right
+            # one.
+            chan.members[target] = "".join(
+                sorted(cur, key=lambda c: symbols.index(c)
+                       if c in symbols else len(symbols)))
+
     async def _update_state(self, network: str, msg: IRCMessage) -> None:
         """Update channel/user state based on upstream messages."""
         if network not in self.channels:
@@ -1094,6 +1210,24 @@ class User:
                 if old_nick in chan.members:
                     prefix = chan.members.pop(old_nick)
                     chan.members[new_nick] = prefix
+
+        elif cmd == "MODE" and msg.params and self._is_channel(msg.params[0]):
+            # Channel MODE. Without this the member prefixes below are frozen
+            # at whatever the *initial* NAMES said: everyone opped or deopped
+            # afterwards keeps their old symbol here forever, and since this
+            # table is what _replay_channel_state sends as NAMES to an
+            # attaching client, every client reattaching sees a stale op list.
+            #
+            # Reported against qtpyrc as "i'm in #ops and it doesn't show me as
+            # having ops even though my friend saw that i have ops and doing
+            # /op on her worked": the reporter had been opped in an earlier
+            # session, the client saw that MODE live and displayed it, this
+            # never recorded it, and the next attach replayed a NAMES without
+            # the "@". The client was showing exactly what it was told.
+            chan = channels.get(msg.params[0].lower())
+            if chan is not None and len(msg.params) >= 2:
+                self._apply_member_modes(upstream, chan, msg.params[1],
+                                         list(msg.params[2:]))
 
         elif cmd == "332" and len(msg.params) >= 3:
             # RPL_TOPIC
