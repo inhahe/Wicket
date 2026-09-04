@@ -1088,6 +1088,29 @@ class User:
         return True
 
     @staticmethod
+    def _member_key(chan, nick: str) -> str | None:
+        """The spelling of *nick* in chan.members, or None if not a member.
+
+        IRC nick identity ignores case; the spelling is only presentation.
+        chan.members is keyed by whatever spelling the server last used, so a
+        PART, QUIT, KICK or NICK carrying a *different* spelling missed the
+        entry entirely -- ``members.pop(nick, None)`` quietly removed nothing.
+        The result is a ghost: somebody who has left stays in the table, and
+        every client that attaches afterwards is handed them in the NAMES that
+        _replay_channel_state builds from it.
+
+        The exact-match fast path is the overwhelmingly common case, so the
+        scan below costs nothing in normal operation.
+        """
+        if nick in chan.members:
+            return nick
+        low = nick.lower()
+        for member in chan.members:
+            if member.lower() == low:
+                return member
+        return None
+
+    @staticmethod
     def _apply_member_modes(upstream, chan, modestr: str,
                             args: list[str]) -> None:
         """Apply one channel MODE change to *chan*.members prefixes.
@@ -1174,7 +1197,11 @@ class User:
                 channels[chan_key].joined = True
                 self._persist_autojoin(network, chan_name, add=True)
             elif chan_key in channels:
-                channels[chan_key].members[nick] = ""
+                chan = channels[chan_key]
+                stale = self._member_key(chan, nick)
+                if stale is not None and stale != nick:
+                    del chan.members[stale]     # same person, new spelling
+                chan.members[nick] = ""
 
         elif cmd == "PART" and msg.source and msg.params:
             nick = IRCMessage.parse_prefix(msg.source)[0]
@@ -1185,7 +1212,8 @@ class User:
                     channels[chan_key].joined = False
                 self._persist_autojoin(network, chan_name, add=False)
             elif chan_key in channels:
-                channels[chan_key].members.pop(nick, None)
+                chan = channels[chan_key]
+                chan.members.pop(self._member_key(chan, nick) or nick, None)
 
         elif cmd == "KICK" and msg.source and len(msg.params) >= 2:
             chan_key = msg.params[0].lower()
@@ -1196,19 +1224,25 @@ class User:
                     channels[chan_key].joined = False
                 self._persist_autojoin(network, chan_name, add=False)
             elif chan_key in channels:
-                channels[chan_key].members.pop(kicked, None)
+                chan = channels[chan_key]
+                chan.members.pop(self._member_key(chan, kicked) or kicked, None)
 
         elif cmd == "QUIT" and msg.source:
             nick = IRCMessage.parse_prefix(msg.source)[0]
             for chan in channels.values():
-                chan.members.pop(nick, None)
+                chan.members.pop(self._member_key(chan, nick) or nick, None)
 
         elif cmd == "NICK" and msg.source and msg.params:
             old_nick = IRCMessage.parse_prefix(msg.source)[0]
             new_nick = msg.params[0]
             for chan in channels.values():
-                if old_nick in chan.members:
-                    prefix = chan.members.pop(old_nick)
+                # Case-insensitively: a NICK whose prefix spelling differs from
+                # the one NAMES stored used to miss, leaving the table naming
+                # somebody who no longer answers to it -- and a case-only
+                # rename ("rockwood" -> "Rockwood") misses every time.
+                stored = self._member_key(chan, old_nick)
+                if stored is not None:
+                    prefix = chan.members.pop(stored)
                     chan.members[new_nick] = prefix
 
         elif cmd == "MODE" and msg.params and self._is_channel(msg.params[0]):
@@ -1266,7 +1300,11 @@ class User:
                     if "!" in nick:
                         nick = nick.split("!")[0]
                     if nick:
-                        channels[chan_key].members[nick] = prefix
+                        chan = channels[chan_key]
+                        stale = self._member_key(chan, nick)
+                        if stale is not None and stale != nick:
+                            del chan.members[stale]
+                        chan.members[nick] = prefix
 
         elif cmd == "366" and len(msg.params) >= 2:
             # RPL_ENDOFNAMES - channel join complete
