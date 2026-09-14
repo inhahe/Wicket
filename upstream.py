@@ -121,6 +121,9 @@ class UpstreamConnection:
         # Retry queue for channels that got "target change too fast"
         # list of (channel, key_or_none, retry_after_timestamp)
         self._join_retry_queue: list[tuple[str, str | None, float]] = []
+        # channel.lower() -> the key the last JOIN for it actually went out
+        # with.  Deliberately outlives a reconnect: see _note_join.
+        self._join_keys: dict[str, str] = {}
         self._join_retry_task: Optional[asyncio.Task] = None
 
         # Guard against concurrent connect() calls.  Without this, a second
@@ -266,6 +269,11 @@ class UpstreamConnection:
     async def _cleanup(self) -> None:
         self.connected = False
         self.registered = False
+        # Our channel membership belonged to the connection that just ended.
+        # ChannelState.joined is set by our own JOIN echo and cleared by our
+        # own PART or KICK -- all three are messages, and a dropped connection
+        # sends none of them, so nothing else clears it.
+        self.user.mark_network_parted(self.network_name)
         # Unregister from ident server
         if self._ident_server and self._ident_local_port is not None:
             self._ident_server.unregister(self._ident_local_port)
@@ -443,8 +451,59 @@ class UpstreamConnection:
                     )
             self._schedule_reconnect()
 
+    def _note_join(self, msg: IRCMessage) -> None:
+        """Remember the key a JOIN actually went out with.
+
+        Every path that re-sends a JOIN -- the 439 retry loop and the rejoin
+        after a reconnect -- used to ask the *autojoin config* for the key,
+        which is a different question from "what did we join with".  A channel
+        joined by hand may not be in that config at all, and one that is may be
+        listed without its key (User._persist_autojoin dropped it), so the
+        answer was None and the JOIN went out bare.  A +k channel answers a
+        bare JOIN with 475 forever, however many times the user supplies the
+        right key -- which is exactly what it looks like from the client: the
+        key is typed once, works once, and is then apparently rejected.
+
+        Recorded when the JOIN is handed to the socket rather than when its
+        echo comes back, because the retry exists precisely for joins that
+        have not succeeded yet.  A JOIN issued while we are down is recorded
+        too, and deliberately: "the key we were last asked to use" is the
+        answer the reconnect wants.
+        """
+        if msg.command != "JOIN" or not msg.params:
+            return
+        channels = msg.params[0].split(",")
+        keys = msg.params[1].split(",") if len(msg.params) > 1 else []
+        for i, chan in enumerate(channels):
+            if not chan or chan == "0":     # "JOIN 0" means part everything
+                continue
+            key = keys[i] if i < len(keys) else ""
+            if key:
+                self._join_keys[chan.lower()] = key
+            else:
+                # A deliberate keyless join is an answer too: it says the
+                # channel no longer needs one.
+                self._join_keys.pop(chan.lower(), None)
+
+    def remembered_key(self, channel: str) -> Optional[str]:
+        """The key we last sent a JOIN for `channel` with, if any."""
+        return self._join_keys.get(channel.lower())
+
+    def key_for(self, channel: str) -> Optional[str]:
+        """The key to use for `channel`: what we last joined with, else what
+        the autojoin config says.  Names are compared case-insensitively, since
+        the config carries whatever spelling the user typed."""
+        key = self.remembered_key(channel)
+        if key:
+            return key
+        for ch, k in self.network_config.autojoin.items():
+            if ch.lower() == channel.lower() and k:
+                return k
+        return None
+
     async def send(self, msg: IRCMessage) -> None:
         """Send through rate limiter."""
+        self._note_join(msg)
         if self.rate_limiter and self.connected:
             data = msg.serialize()
             irc_log.debug("[%s/%s] >>> %s", self.user.username, self.network_name, data.decode("utf-8", errors="replace").rstrip())
@@ -452,6 +511,7 @@ class UpstreamConnection:
 
     async def send_now(self, msg: IRCMessage) -> None:
         """Send immediately, bypassing rate limiter."""
+        self._note_join(msg)
         if self.writer and self.connected:
             data = msg.serialize()
             irc_log.debug("[%s/%s] >>> %s", self.user.username, self.network_name, data.decode("utf-8", errors="replace").rstrip())
@@ -746,14 +806,9 @@ class UpstreamConnection:
         if match:
             delay = int(match.group(1)) + 2  # add a small buffer
 
-        # Look up the key for this channel from our autojoin config
-        key = self.network_config.autojoin.get(target)
-        # Also check case-insensitively
-        if key is None:
-            for ch, k in self.network_config.autojoin.items():
-                if ch.lower() == target.lower():
-                    key = k
-                    break
+        # The key we actually joined with, falling back to the config.  Asking
+        # the config alone is what re-sent a bare JOIN to a +k channel.
+        key = self.key_for(target)
 
         now = time.time()
         retry_at = now + delay
@@ -823,8 +878,12 @@ class UpstreamConnection:
         # Separate channels with keys from those without, since JOIN
         # requires keys to correspond positionally to channels.
         # Send keyed channels first (IRC requires keys to match left-to-right).
-        keyed = [(ch, key) for ch, key in self.network_config.autojoin.items() if key]
-        unkeyed = [ch for ch, key in self.network_config.autojoin.items() if not key]
+        # key_for, not the raw config value: a channel joined by hand with a
+        # key must be rejoined with it after a reconnect even when the config
+        # was never told about it.
+        pairs = [(ch, self.key_for(ch)) for ch in self.network_config.autojoin]
+        keyed = [(ch, key) for ch, key in pairs if key]
+        unkeyed = [ch for ch, key in pairs if not key]
 
         # Send keyed channels in batches
         for i in range(0, len(keyed), 4):

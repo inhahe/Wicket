@@ -1174,6 +1174,26 @@ class User:
                 sorted(cur, key=lambda c: symbols.index(c)
                        if c in symbols else len(symbols)))
 
+    def mark_network_parted(self, network: str) -> None:
+        """Forget the channel membership of a connection that has ended.
+
+        Called from UpstreamConnection._cleanup, which is the single funnel
+        every disconnect goes through.  Without it the table survived a
+        reconnect still claiming every channel we had been in, and an
+        attaching client was handed two lies, neither of which announced
+        itself: _replay_channel synthesised a JOIN for a channel we were not
+        in -- so the client opened a window for a channel nobody was in, and
+        then showed it the 475 that said so -- and the NAMES it built came
+        from a member list belonging to the previous connection.
+
+        The members go too.  Who is in a channel is a fact about a connection
+        we no longer have; the rejoin's NAMES is the authority, and until it
+        arrives we know nothing.
+        """
+        for chan in self.channels.get(network, {}).values():
+            chan.joined = False
+            chan.members.clear()
+
     async def _update_state(self, network: str, msg: IRCMessage) -> None:
         """Update channel/user state based on upstream messages."""
         if network not in self.channels:
@@ -1356,6 +1376,32 @@ class User:
             logger.exception("Error routing downstream message from %s: %s",
                              ds.nick, msg.command)
 
+    def _report_upstream_down(
+        self, ds: DownstreamConnection, msg: IRCMessage
+    ) -> None:
+        """Tell a client its command went nowhere, in the window it used.
+
+        A plain bouncer message is addressed to the user's own nick, so clients
+        file it wherever they put private notices -- never the channel it was
+        typed in. That is invisible feedback for a client relying on
+        echo-message to draw its own sent lines: the channel shows neither the
+        message nor any hint that it failed, which is exactly how three
+        messages can vanish without a word. Reporting into the channel puts the
+        failure next to where the user was looking.
+
+        Only channel targets can be reported this way. There is no way to place
+        a line in a query window without impersonating the other party, so
+        private messages keep the addressed-to-you notice.
+        """
+        text = f"Not connected to {ds.network}"
+        target = msg.params[0] if msg.params else ""
+        if msg.command in ("PRIVMSG", "NOTICE") and self._is_channel(target):
+            self.deliver_channel_bouncer_message(
+                ds, target, f"{text} - your message was NOT sent",
+            )
+            return
+        self.deliver_bouncer_message(ds, text)
+
     async def _route_downstream_message(
         self, ds: DownstreamConnection, msg: IRCMessage
     ) -> None:
@@ -1379,7 +1425,11 @@ class User:
                 return
 
         if not upstream or not upstream.connected:
-            self.deliver_bouncer_message(ds, f"Not connected to {ds.network}")
+            # Typing notifications are background chatter the client sends on
+            # its own; answering each one with an error turns a dead upstream
+            # into a stream of notices -- three or four for every line typed.
+            if cmd != "TAGMSG":
+                self._report_upstream_down(ds, msg)
             return
 
         # Record our own messages so every device sees them, not just the one
@@ -1738,13 +1788,29 @@ class User:
 
         existing_lower = {c.lower() for c in nc.autojoin}
 
-        if add and channel.lower() not in existing_lower:
-            # Check if we have a pending key from the client's JOIN command
-            key = None
-            pending = self._pending_keys.get(network, {})
-            if channel.lower() in pending:
-                key = pending.pop(channel.lower())
-            nc.autojoin[channel] = key
+        if add:
+            # The key the client's JOIN carried, else the one the upstream
+            # actually joined with.
+            key = self._pending_keys.get(network, {}).pop(channel.lower(), None)
+            if key is None:
+                up = self.upstreams.get(network)
+                if up is not None:
+                    key = up.remembered_key(channel)
+
+            existing_name = next(
+                (c for c in nc.autojoin if c.lower() == channel.lower()), None)
+            if existing_name is None:
+                nc.autojoin[channel] = key
+            elif key is not None and nc.autojoin[existing_name] != key:
+                # An entry that is already listed is not "no change needed":
+                # its key can be new.  Dropping it here is how a channel first
+                # joined without one kept `None` for good -- after which every
+                # reconnect and every retry re-sent a bare JOIN, and a +k
+                # channel answered 475 no matter how often the user supplied
+                # the right key.
+                nc.autojoin[existing_name] = key
+            else:
+                return  # No change needed
         elif not add and channel.lower() in existing_lower:
             nc.autojoin = {c: k for c, k in nc.autojoin.items() if c.lower() != channel.lower()}
         else:

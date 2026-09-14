@@ -211,6 +211,25 @@ replay the target's entire stored history. It replays at most the last
 a new PM partner's whole conversation still arrives, while a long-lived
 channel does not dump thousands of lines on first sight.
 
+### When the network is down
+
+A message you type while Wicket's upstream is disconnected cannot be sent, and
+Wicket does not queue it — it would arrive minutes later, out of context, in a
+conversation that had moved on. It is refused instead.
+
+If it was addressed to a channel, the refusal is written **into that channel's
+window** (`Not connected to <network> - your message was NOT sent`). It has to
+be: the refusal used to go out as a notice addressed to your nick, which
+clients file wherever they put private notices, so a client relying on
+`echo-message` — one that draws no local echo and waits for Wicket's copy —
+showed neither the message nor any hint it had failed. Private messages still
+get the addressed-to-you notice, since there is no way to write into a query
+window without impersonating the other party.
+
+Typing notifications (`TAGMSG`) are refused silently. They are sent by the
+client on its own initiative, and reporting each one produced three or four
+errors for every line actually typed.
+
 ### Very large backlogs
 
 At most `REPLAY_LIMIT` messages (default 4096) are replayed per target
@@ -388,12 +407,20 @@ The dict form lets you specify channel keys. `null` means no key.
 
 When you `/join` or `/part` a channel through Wicket, the autojoin
 list is updated and persisted to `config.yaml` automatically (with
-formatting/comments preserved).
+formatting/comments preserved). That includes the **key**: joining a
+channel that is already listed, with a key it was not listed with,
+updates the entry rather than leaving it as it was.
+
+Wicket also remembers the key of every JOIN it sends for the life of
+the process, and prefers it to the configured one. So a channel you
+join by hand -- one that is not in `autojoin` at all, or is listed
+with no key -- is rejoined with the right key after a reconnect,
+without your having to write it into the config first.
 
 If a channel join is rejected by the server with "target change too
 fast" (numerics 439, 480, or 263), Wicket schedules a retry using
 the wait time the server suggested, deduping retries per channel so
-the queue doesn't pile up.
+the queue doesn't pile up. The retry carries the key.
 
 ---
 
