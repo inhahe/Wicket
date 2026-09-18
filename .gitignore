@@ -1,0 +1,20 @@
+
+# Local-only. We publish straight from this directory now instead of copying
+# a filtered subset into D:\github, so these are excluded here instead.
+old/
+tests/
+__pycache__/
+me/
+.claude/
+Wicket.db*
+*.log
+*.log.*
+bugs.txt
+caps.txt
+copy_to_repo.bat
+design.md
+go.bat
+orchestrator2.log
+test_client.py
+todo.txt
+*.txt
