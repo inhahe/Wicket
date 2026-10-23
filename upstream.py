@@ -149,7 +149,15 @@ class UpstreamConnection:
         return self._should_reconnect
 
     async def connect(self) -> None:
-        """Connect to the IRC server, trying each configured server in order."""
+        """Connect to the IRC server, trying each configured server in order.
+
+        Never raises, cancellation aside.  Every caller starts this as a task
+        and none awaits it for a result, so an exception here would be reported
+        by nobody; and one raised partway through registration would leave the
+        socket open and half-registered until the server timed it out.  So a
+        failure is logged, the connection torn down, and a reconnect scheduled
+        as for any other failure.
+        """
         if self._connecting:
             logger.debug("connect() already in progress for %s, skipping",
                          self.network_name)
@@ -157,6 +165,10 @@ class UpstreamConnection:
         self._connecting = True
         try:
             await self._connect_inner()
+        except Exception:
+            logger.exception("Connecting to %s failed", self.network_name)
+            await self._cleanup()
+            self._schedule_reconnect()
         finally:
             self._connecting = False
 
