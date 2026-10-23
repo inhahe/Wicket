@@ -1544,7 +1544,7 @@ class User:
         elif cmd == "LISTNETWORKS":
             for net_name in self.config.networks:
                 up = self.upstreams.get(net_name)
-                state = self._network_state(up) if up else "not configured"
+                state = up.state if up else "not configured"
                 self.deliver_bouncer_message(ds, f"  {net_name}: {state}")
         elif cmd == "CONNECT":
             await self._handle_connect(ds, parts[1:])
@@ -1558,24 +1558,6 @@ class User:
             await self._handle_activity(ds, parts[1:])
         else:
             self.deliver_bouncer_message(ds, f"Unknown command: {cmd}")
-
-    @staticmethod
-    def _network_state(upstream: "UpstreamConnection") -> str:
-        """Short state for LISTNETWORKS (STATUS gives UpstreamConnection.describe()).
-
-        "disconnected" alone can't be acted on: it covers both a network that
-        is about to retry on its own and one that has been told to stay down,
-        and those want opposite things from the user.
-        """
-        if upstream.connected and upstream.registered:
-            return "connected"
-        if upstream.connected:
-            return "registering"
-        if upstream.reconnect_pending:
-            return "reconnecting"
-        if not upstream.reconnect_enabled:
-            return "disconnected (staying down)"
-        return "disconnected"
 
     async def _handle_connect(self, ds: DownstreamConnection, args: list[str]) -> None:
         """Handle the CONNECT bouncer command."""

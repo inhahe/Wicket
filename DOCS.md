@@ -658,11 +658,11 @@ networks:
     auto_connect: false
 ```
 
-`LISTNETWORKS` distinguishes the two kinds of "down": `reconnecting`
-means an attempt is scheduled or in flight, while `disconnected
-(staying down)` means nothing will happen until you say so. A network
-with `auto_connect: false` reports `disconnected (staying down)` from
-startup, since that setting and `DISCONNECT` put it in the same state.
+`LISTNETWORKS` shows each network as `connected`, `registering`,
+`connecting`, `reconnecting` (an attempt is scheduled) or `staying
+down` (nothing will happen until you say so). A network with
+`auto_connect: false` reports `staying down` from startup, since that
+setting and `DISCONNECT` put it in the same state.
 
 `STATUS`, and the notice you get when you attach to a network that is
 not connected, say more: whether it is connecting (and to which
@@ -675,7 +675,10 @@ Attached to libera (upstream is down, reconnecting in 4m; CONNECT libera to try 
 Last failure, 1m ago: irc.libera.chat:6697: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired
 ```
 
-The failure is cleared when the network next registers successfully.
+When the wait is a ban, or the wait for the server to drop a session
+that ended uncleanly, it says so instead of suggesting `CONNECT`:
+connecting early renews the ban, or can earn one. The failure is
+cleared when the network next registers successfully.
 
 **Attaching a client does not override either of them.** Normally,
 pointing a client at a network that happens to be down makes Wicket dial

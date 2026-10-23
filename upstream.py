@@ -43,6 +43,12 @@ _EXCONN_BACKOFF_INITIAL = 90000.0  # 25 h — first "excessive connections" ban 
 _BAN_BACKOFF_MAX = 172800.0      # 48 h cap for repeated bans
 
 
+def _fit(text: str) -> str:
+    """A failure as it is kept: bounded, since it is sent as one NOTICE and a
+    server's ERROR is free text."""
+    return text if len(text) <= 300 else text[:297] + "..."
+
+
 def _span(seconds: float) -> str:
     """A duration the way a person says it: 45s, 12m, 25h, 2d."""
     if seconds < 60:
@@ -79,17 +85,19 @@ class UpstreamConnection:
         self._start_fresh()
         self.connected: bool = False
 
-        self.isupport: dict[str, str | None] = {}
+        # What the server told us about itself; see _forget_server.
+        self.isupport: dict[str, str | None]
         self.server_name: str = ""
         # PREFIX=(ov)@+ -- the two halves, in matching order, so that a mode
         # letter can be turned into the symbol it grants. Tracking the symbols
         # alone is enough to *parse* a NAMES reply but not to apply a MODE.
-        self.prefix_modes: str = "ov"   # default, paired with nick_prefixes
-        self.nick_prefixes: str = "@+"  # default
+        self.prefix_modes: str
+        self.nick_prefixes: str
         # CHANMODES=A,B,C,D -- needed to know which mode letters consume an
         # argument, so the arguments line up with the letters that own them.
-        self.chan_modes: str = ""
-        self.casemapping: str = "rfc1459"
+        self.chan_modes: str
+        self.casemapping: str
+        self._forget_server()
 
         # Server rotation
         self._server_index: int = 0
@@ -195,29 +203,55 @@ class UpstreamConnection:
             return None
         return max(0.0, self._reconnect_at - time.monotonic())
 
+    @property
+    def state(self) -> str:
+        """One of "connected", "registering", "connecting", "reconnecting",
+        "staying down".
+
+        The one classification of this connection: LISTNETWORKS shows it as
+        is, and describe() (STATUS, the attach notice) adds the detail.
+        """
+        if self.connected:
+            return "connected" if self.registered else "registering"
+        if self._connecting:
+            return "connecting"
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return "reconnecting"
+        if not self._should_reconnect:
+            return "staying down"
+        # Armed with nothing scheduled: only before the first dial, which is
+        # already on its way (startup, or the client attaching).
+        return "connecting"
+
     def describe(self) -> str:
         """Where this network stands, as a phrase for someone deciding what to do.
 
         "Not connected" alone cannot be acted on: it covers a network about to
         come back, one waiting out a backoff, one stuck registering, and one
-        told to stay down.  This says which, and what to send to change it.
+        told to stay down.  This says which, and what to send to change it --
+        or, when the wait is a ban or the server's limits, not to.
         """
-        name = self.network_name
-        if self.connected and self.registered:
-            return "connected"
-        if self.connected:
+        name, state = self.network_name, self.state
+        if state == "registering":
             since = time.monotonic() - (self._connected_at or time.monotonic())
             return f"registering with {self._dialing}, for {_span(since)} so far"
-        if self._connecting:
-            return f"connecting to {self._dialing}" if self._dialing else "connecting"
-        wait = self.reconnect_in
-        if wait is not None:
-            return f"down, reconnecting in {_span(wait)}; CONNECT {name} to try now"
-        if not self._should_reconnect:
+        if state == "connecting":
+            return f"connecting to {self._dialing}" if self._connecting and self._dialing \
+                else "connecting"
+        if state == "reconnecting":
+            wait = self.reconnect_in
+            when = f" in {_span(wait)}" if wait is not None else ""
+            # CONNECT dials at once and resets the backoff, which is exactly
+            # what a ban floor or the ghost-reap wait exists to prevent.
+            if self._consecutive_bans:
+                return f"down and banned, reconnecting{when}; connecting sooner renews the ban"
+            if self._min_reconnect_delay:
+                return (f"down, reconnecting{when} once the server has dropped the old "
+                        f"session; connecting sooner risks a ban")
+            return f"down, reconnecting{when}; CONNECT {name} to try now"
+        if state == "staying down":
             return f"down and staying down; CONNECT {name} to connect"
-        # Armed with nothing scheduled: only before the first dial, which is
-        # already on its way (startup, or the client attaching).
-        return "connecting"
+        return state
 
     def describe_last_failure(self) -> Optional[str]:
         """How the last attempt failed and how long ago, while not connected."""
@@ -227,20 +261,24 @@ class UpstreamConnection:
         return f"Last failure, {_span(time.monotonic() - at)} ago: {text}"
 
     def _note_failure(self, text: str) -> None:
-        # Bounded: it is sent as one NOTICE, and a server's ERROR is free text.
-        if len(text) > 300:
-            text = text[:297] + "..."
-        self.last_failure = (time.monotonic(), text)
+        self.last_failure = (time.monotonic(), _fit(text))
+
+    def _failure_noted_this_connection(self) -> bool:
+        """Whether something has already said why the current connection ended
+        -- usually the server's ERROR, which says more than the close after it."""
+        return (self.last_failure is not None and self._connected_at is not None
+                and self.last_failure[0] >= self._connected_at)
 
     async def connect(self) -> None:
         """Connect to the IRC server, trying each configured server in order.
 
-        Never raises, cancellation aside.  Every caller starts this as a task
-        and none awaits it for a result, so an exception here would be reported
-        by nobody; and one raised partway through registration would leave the
-        socket open and half-registered until the server timed it out.  So a
-        failure is logged, the connection torn down, and a reconnect scheduled
-        as for any other failure.
+        Never raises, cancellation aside.  Most callers start this as a task
+        nobody awaits, and the rest (CONNECT, the startup gather) have nothing
+        to do with an exception but drop it; meanwhile one raised partway
+        through registration would leave the socket open and half-registered
+        until the server timed it out.  So an unexpected failure -- a bug, not
+        a network problem, which _connect_inner handles itself -- is logged,
+        the connection torn down, and a reconnect scheduled.
         """
         if self._connecting:
             logger.debug("connect() already in progress for %s, skipping",
@@ -250,9 +288,15 @@ class UpstreamConnection:
         try:
             await self._connect_inner()
         except Exception as e:
-            logger.exception("Connecting to %s failed", self.network_name)
-            self._note_failure(f"internal error while connecting: "
-                               f"{type(e).__name__}: {e} (details in the log)")
+            text = _fit(f"internal error while connecting: "
+                        f"{type(e).__name__}: {e} (details in the log)")
+            # The same bug fails every retry; one traceback is enough.
+            if self.last_failure is not None and self.last_failure[1] == text:
+                logger.error("Connecting to %s failed again: %s: %s",
+                             self.network_name, type(e).__name__, e)
+            else:
+                logger.exception("Connecting to %s failed", self.network_name)
+            self._note_failure(text)
             await self._cleanup()
             self._schedule_reconnect()
         finally:
@@ -288,9 +332,18 @@ class UpstreamConnection:
                 if not sc.tls_verify:
                     ssl_ctx.check_hostname = False
                     ssl_ctx.verify_mode = ssl.CERT_NONE
-                # Load client cert for SASL EXTERNAL
-                if self.network_config.sasl and self.network_config.sasl.cert_path:
-                    ssl_ctx.load_cert_chain(self.network_config.sasl.cert_path)
+                # Load client cert for SASL EXTERNAL.  A missing or unreadable
+                # file is a failure of this attempt like any other, not a bug.
+                cert_path = self.network_config.sasl and self.network_config.sasl.cert_path
+                if cert_path:
+                    try:
+                        ssl_ctx.load_cert_chain(cert_path)
+                    except (OSError, ssl.SSLError) as e:
+                        logger.warning("Cannot load the SASL client certificate for %s: %s",
+                                       self.network_name, e)
+                        self._note_failure(f"cannot load the SASL client certificate "
+                                           f"{cert_path}: {e}")
+                        continue
 
             try:
                 self.reader, self.writer = await asyncio.open_connection(
@@ -520,17 +573,15 @@ class UpstreamConnection:
                                          self.network_name, line.decode("utf-8", errors="replace"))
         except (ConnectionError, OSError) as e:
             logger.warning("Connection lost to %s: %s", self.network_name, e)
-            self._note_failure(f"connection to {self._dialing} lost: {e}")
+            if not self._failure_noted_this_connection():
+                self._note_failure(f"connection to {self._dialing} lost: {e}")
             unclean = True
         except asyncio.CancelledError:
             return
 
-        # The server closing the socket usually follows an ERROR, which said
-        # more; keep that.  (The loop also ends when `connected` is cleared by
-        # our own teardown, which has recorded its own reason.)
-        said_why = (self.last_failure is not None and self._connected_at is not None
-                    and self.last_failure[0] >= self._connected_at)
-        if eof and not said_why:
+        # (The loop also ends when `connected` is cleared by our own teardown,
+        # which has recorded its own reason.)
+        if eof and not self._failure_noted_this_connection():
             self._note_failure(f"{self._dialing} closed the connection")
         self.connected = False
         logger.info("Disconnected from %s", self.network_name)
@@ -704,6 +755,7 @@ class UpstreamConnection:
         if cmd in ("001", "002", "003", "004", "005"):
             self.welcome_msgs.append(msg)
             if cmd == "001":
+                self._forget_server()
                 self.server_name = msg.source or ""
                 # The nick we actually got
                 if msg.params:
@@ -826,6 +878,21 @@ class UpstreamConnection:
                 await self.send_now(IRCMessage(
                     command="AUTHENTICATE", params=[chunk]
                 ))
+
+    def _forget_server(self) -> None:
+        """Drop what the last server said about itself in ISUPPORT.
+
+        Called when a new registration begins (001), not when the connection
+        drops: a client attaching while the network is down is still sent the
+        last 005, which keeps its idea of the network's name and prefixes.
+        But _parse_isupport only adds and overwrites, so without this a token
+        the previous server sent and the new one does not would outlive it.
+        """
+        self.isupport = {}
+        self.prefix_modes = "ov"   # defaults, paired with each other
+        self.nick_prefixes = "@+"
+        self.chan_modes = ""
+        self.casemapping = "rfc1459"
 
     def _parse_isupport(self, msg: IRCMessage) -> None:
         """Parse RPL_ISUPPORT (005) tokens."""
