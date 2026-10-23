@@ -705,7 +705,7 @@ They differ only in when they take effect.
 
 **Applied immediately:**
 
-- Logging configuration
+- Logging configuration, `motd`
 - Per-user passwords, delivery, delivery_source
 - Per-network `rate_limit_ms` (live-applied to active connections)
 - Autojoin lists, `unclean_reconnect_delay`, `downstream_caps` (for

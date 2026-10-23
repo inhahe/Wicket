@@ -572,15 +572,18 @@ class User:
                     source=self.server_name,
                 ))
 
-        # MOTD (minimal)
+        # MOTD: the configured one (read at each attach, so REHASH changes it),
+        # or one line saying where the client is.
+        motd = ds.bouncer.config.motd
         await ds.send(IRCMessage(
             command="375", params=[nick, f"- {self.server_name} Message of the Day -"],
             source=self.server_name,
         ))
-        await ds.send(IRCMessage(
-            command="372", params=[nick, f"- Welcome to Wicket"],
-            source=self.server_name,
-        ))
+        for line in (motd.splitlines() if motd else ["Welcome to Wicket"]):
+            await ds.send(IRCMessage(
+                command="372", params=[nick, f"- {line}"],
+                source=self.server_name,
+            ))
         await ds.send(IRCMessage(
             command="376", params=[nick, "End of /MOTD command."],
             source=self.server_name,
