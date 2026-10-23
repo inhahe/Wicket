@@ -43,6 +43,17 @@ _EXCONN_BACKOFF_INITIAL = 90000.0  # 25 h — first "excessive connections" ban 
 _BAN_BACKOFF_MAX = 172800.0      # 48 h cap for repeated bans
 
 
+def _span(seconds: float) -> str:
+    """A duration the way a person says it: 45s, 12m, 25h, 2d."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 172800:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
 class UpstreamConnection:
     def __init__(self, user: User, network_config: NetworkConfig, ident_server: IdentServer | None = None):
         self.user = user
@@ -127,6 +138,15 @@ class UpstreamConnection:
         # creating zombie connections that are never cleaned up.
         self._connecting: bool = False
 
+        # For describe(): why the last attempt ended, as (time.monotonic(),
+        # text), cleared by a successful registration; the server being
+        # dialled or registered with; when the socket opened; and when the
+        # scheduled reconnect fires.
+        self.last_failure: Optional[tuple[float, str]] = None
+        self._dialing: str = ""
+        self._connected_at: Optional[float] = None
+        self._reconnect_at: Optional[float] = None
+
     def _start_fresh(self) -> None:
         """Reset what one connection negotiates, from the config as it is now.
 
@@ -167,6 +187,51 @@ class UpstreamConnection:
         """True if a future failure would schedule another attempt."""
         return self._should_reconnect
 
+    @property
+    def reconnect_in(self) -> Optional[float]:
+        """Seconds until the scheduled reconnect dials; None if none is waiting."""
+        task = self._reconnect_task
+        if task is None or task.done() or self._reconnect_at is None:
+            return None
+        return max(0.0, self._reconnect_at - time.monotonic())
+
+    def describe(self) -> str:
+        """Where this network stands, as a phrase for someone deciding what to do.
+
+        "Not connected" alone cannot be acted on: it covers a network about to
+        come back, one waiting out a backoff, one stuck registering, and one
+        told to stay down.  This says which, and what to send to change it.
+        """
+        name = self.network_name
+        if self.connected and self.registered:
+            return "connected"
+        if self.connected:
+            since = time.monotonic() - (self._connected_at or time.monotonic())
+            return f"registering with {self._dialing}, for {_span(since)} so far"
+        if self._connecting:
+            return f"connecting to {self._dialing}" if self._dialing else "connecting"
+        wait = self.reconnect_in
+        if wait is not None:
+            return f"down, reconnecting in {_span(wait)}; CONNECT {name} to try now"
+        if not self._should_reconnect:
+            return f"down and staying down; CONNECT {name} to connect"
+        # Armed with nothing scheduled: only before the first dial, which is
+        # already on its way (startup, or the client attaching).
+        return "connecting"
+
+    def describe_last_failure(self) -> Optional[str]:
+        """How the last attempt failed and how long ago, while not connected."""
+        if self.last_failure is None or (self.connected and self.registered):
+            return None
+        at, text = self.last_failure
+        return f"Last failure, {_span(time.monotonic() - at)} ago: {text}"
+
+    def _note_failure(self, text: str) -> None:
+        # Bounded: it is sent as one NOTICE, and a server's ERROR is free text.
+        if len(text) > 300:
+            text = text[:297] + "..."
+        self.last_failure = (time.monotonic(), text)
+
     async def connect(self) -> None:
         """Connect to the IRC server, trying each configured server in order.
 
@@ -184,8 +249,10 @@ class UpstreamConnection:
         self._connecting = True
         try:
             await self._connect_inner()
-        except Exception:
+        except Exception as e:
             logger.exception("Connecting to %s failed", self.network_name)
+            self._note_failure(f"internal error while connecting: "
+                               f"{type(e).__name__}: {e} (details in the log)")
             await self._cleanup()
             self._schedule_reconnect()
         finally:
@@ -213,6 +280,7 @@ class UpstreamConnection:
             sc = servers[idx]
             logger.info("Connecting to %s:%d (TLS: %s) for %s/%s",
                          sc.host, sc.port, sc.tls, self.user.username, self.network_name)
+            self._dialing = f"{sc.host}:{sc.port}"
 
             ssl_ctx = None
             if sc.tls:
@@ -230,6 +298,7 @@ class UpstreamConnection:
                 )
             except (OSError, ssl.SSLError) as e:
                 logger.warning("Connection failed to %s:%d: %s", sc.host, sc.port, e)
+                self._note_failure(f"{sc.host}:{sc.port}: {e}")
                 continue  # Try next server
 
             # DISCONNECT may have arrived while we were dialing. Its cleanup ran
@@ -250,6 +319,7 @@ class UpstreamConnection:
             # Connected successfully (TCP level — registration may still fail)
             self._server_index = idx
             self.connected = True
+            self._connected_at = time.monotonic()
 
             # Register with ident server
             if self._ident_server:
@@ -301,6 +371,7 @@ class UpstreamConnection:
     async def _cleanup(self) -> None:
         self.connected = False
         self.registered = False
+        self._connected_at = None
         # Our channel membership belonged to the connection that just ended.
         # ChannelState.joined is set by our own JOIN echo and cleared by our
         # own PART or KICK -- all three are messages, and a dropped connection
@@ -401,6 +472,7 @@ class UpstreamConnection:
         # exponential backoff so we don't renew a G-line by reconnecting early.
         delay = max(self._reconnect_delay, self._min_reconnect_delay)
         self._reconnect_delay = min(self._reconnect_delay * 2, _NORMAL_BACKOFF_MAX)
+        self._reconnect_at = time.monotonic() + delay
         self._reconnect_task = asyncio.create_task(self._reconnect(delay))
 
     async def _reconnect(self, delay: float) -> None:
@@ -421,11 +493,13 @@ class UpstreamConnection:
         # leaves a "ghost" session on the server until its PING timeout; see
         # the reconnect-scheduling block below.
         unclean = False
+        eof = False
         try:
             buf = b""
             while self.connected:
                 data = await self.reader.read(4096)
                 if not data:
+                    eof = True
                     break  # clean EOF — the server closed the socket, so it
                            # knows we're gone and won't leave a ghost.
                 buf += data
@@ -446,10 +520,18 @@ class UpstreamConnection:
                                          self.network_name, line.decode("utf-8", errors="replace"))
         except (ConnectionError, OSError) as e:
             logger.warning("Connection lost to %s: %s", self.network_name, e)
+            self._note_failure(f"connection to {self._dialing} lost: {e}")
             unclean = True
         except asyncio.CancelledError:
             return
 
+        # The server closing the socket usually follows an ERROR, which said
+        # more; keep that.  (The loop also ends when `connected` is cleared by
+        # our own teardown, which has recorded its own reason.)
+        said_why = (self.last_failure is not None and self._connected_at is not None
+                    and self.last_failure[0] >= self._connected_at)
+        if eof and not said_why:
+            self._note_failure(f"{self._dialing} closed the connection")
         self.connected = False
         logger.info("Disconnected from %s", self.network_name)
         if self._should_reconnect:
@@ -567,6 +649,7 @@ class UpstreamConnection:
         if cmd == "ERROR":
             error_text = " ".join(msg.params)
             self._note_disconnect_reason(error_text)
+            self._note_failure(f"{self._dialing} said: {error_text}")
             # Forward ERROR to downstream clients so the user sees it
             await self.user.route_upstream_message(self.network_name, msg)
             return
@@ -626,6 +709,7 @@ class UpstreamConnection:
                 if msg.params:
                     self.nick = msg.params[0]
                 self.registered = True
+                self.last_failure = None
                 # Reset all backoff state on a successful registration.
                 self._reconnect_delay = 1.0
                 self._min_reconnect_delay = 0.0

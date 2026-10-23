@@ -623,7 +623,7 @@ configured `server_name` instead (most clients route this to the
 | Command | Description |
 |---|---|
 | `HELP` | List available commands |
-| `STATUS` | Show connection status and client count for each network |
+| `STATUS` | Show each network's state, client count, and (while it is not connected) its last failure |
 | `LISTNETWORKS` | List all configured networks and connection state |
 | `CONNECT <network>` | Connect (or reconnect) to a network |
 | `DISCONNECT <network>` | Disconnect from a network and stop reconnecting to it, without stopping the bouncer |
@@ -655,12 +655,24 @@ networks:
     auto_connect: false
 ```
 
-`STATUS` and `LISTNETWORKS` distinguish the two kinds of "down":
-`reconnecting` means an attempt is scheduled or in flight, while
-`disconnected (staying down)` means nothing will happen until you say
-so. A network with `auto_connect: false` reports `disconnected (staying
-down)` from startup, since that setting and `DISCONNECT` put it in the
-same state.
+`LISTNETWORKS` distinguishes the two kinds of "down": `reconnecting`
+means an attempt is scheduled or in flight, while `disconnected
+(staying down)` means nothing will happen until you say so. A network
+with `auto_connect: false` reports `disconnected (staying down)` from
+startup, since that setting and `DISCONNECT` put it in the same state.
+
+`STATUS`, and the notice you get when you attach to a network that is
+not connected, say more: whether it is connecting (and to which
+server), still registering (and for how long), waiting to reconnect
+(and for how long), or staying down. Then, on a line of its own, comes
+how the last attempt failed and how long ago:
+
+```
+Attached to libera (upstream is down, reconnecting in 4m; CONNECT libera to try now)
+Last failure, 1m ago: irc.libera.chat:6697: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired
+```
+
+The failure is cleared when the network next registers successfully.
 
 **Attaching a client does not override either of them.** Normally,
 pointing a client at a network that happens to be down makes Wicket dial
@@ -671,7 +683,7 @@ false` and every `DISCONNECT`.) When you attach to a network that is
 staying down, Wicket says so and leaves it alone:
 
 ```
-Attached to undernet (upstream is not connected — use CONNECT undernet to connect)
+Attached to undernet (upstream is down and staying down; CONNECT undernet to connect)
 ```
 
 `SETPASSWORD` requires the new password to be at least 4 characters.

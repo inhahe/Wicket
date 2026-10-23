@@ -320,8 +320,10 @@ class User:
                 self.deliver_bouncer_message(ds, f"Connected to {network}")
             else:
                 self.deliver_bouncer_message(
-                    ds, f"Attached to {network} (upstream is not connected — "
-                        f"use CONNECT {network} to connect)")
+                    ds, f"Attached to {network} (upstream is {upstream.describe()})")
+                failure = upstream.describe_last_failure()
+                if failure:
+                    self.deliver_bouncer_message(ds, failure)
 
                 # Still replay backscroll from previous sessions
                 capped = await self._replay_backscroll(ds, network, identifier)
@@ -1531,8 +1533,11 @@ class User:
             for net_name, up in self.upstreams.items():
                 n_clients = len(self.downstreams.get(net_name, []))
                 self.deliver_bouncer_message(
-                    ds, f"  {net_name}: {self._network_state(up)} ({n_clients} clients)"
+                    ds, f"  {net_name}: {up.describe()} ({n_clients} clients)"
                 )
+                failure = up.describe_last_failure()
+                if failure:
+                    self.deliver_bouncer_message(ds, f"    {failure}")
         elif cmd == "LISTNETWORKS":
             for net_name in self.config.networks:
                 up = self.upstreams.get(net_name)
@@ -1553,7 +1558,7 @@ class User:
 
     @staticmethod
     def _network_state(upstream: "UpstreamConnection") -> str:
-        """One-word state for STATUS / LISTNETWORKS.
+        """Short state for LISTNETWORKS (STATUS gives UpstreamConnection.describe()).
 
         "disconnected" alone can't be acted on: it covers both a network that
         is about to retry on its own and one that has been told to stay down,
