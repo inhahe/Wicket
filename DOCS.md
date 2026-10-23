@@ -325,9 +325,12 @@ Each level overrides the one above it:
 Cascading settings:
 
 `nick`, `alt_nicks`, `user`, `ident_username`, `realname`,
-`delivery`, `delivery_source`, `auto_connect`, `rate_limit_ms`,
+`auto_connect`, `rate_limit_ms`, `unclean_reconnect_delay`,
 `caps_wanted`, `upstream_caps`, `downstream_caps`, `replay_activity`,
 `replay_activity_target`
+
+`delivery` and `delivery_source` cascade to the user level only: they
+decide how Wicket talks to you, which is the same on every network.
 
 Defaults:
 

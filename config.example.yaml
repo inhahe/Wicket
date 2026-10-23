@@ -18,9 +18,10 @@
 #
 # Cascading settings:
 #   nick, alt_nicks, user, ident_username, realname,
-#   delivery, delivery_source,
 #   auto_connect, rate_limit_ms, unclean_reconnect_delay, caps_wanted,
-#   upstream_caps, downstream_caps, replay_activity
+#   upstream_caps, downstream_caps, replay_activity, replay_activity_target
+#
+# delivery and delivery_source cascade to the user level only.
 #
 # replay_activity also supports a fourth level: per-channel overrides
 # channel_replay_activity at the network level.

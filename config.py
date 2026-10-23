@@ -1,7 +1,7 @@
 """YAML configuration loading and validation."""
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import datetime
 import difflib
 import functools
@@ -141,7 +141,7 @@ class ListenConfig:
 
 @dataclass
 class LoggingConfig:
-    level: Literal["debug", "info", "warning", "error", "critical"] = "info"
+    level: Literal["debug", "info", "warning", "warn", "error", "critical", "fatal"] = "info"
     file: Optional[str] = None  # Log file path (None = stderr only)
     max_bytes: int = 10_000_000  # 10 MB default for rotation
     backup_count: int = 5  # Number of rotated log files to keep
@@ -239,8 +239,8 @@ _CASCADING = frozenset({
     "downstream_caps", "replay_activity", "replay_activity_target",
 })
 
-# Fields whose values are never repeated in a message.
-_SECRETS = frozenset({"password"})
+# Fields whose values are never repeated in a message (autojoin holds channel keys).
+_SECRETS = frozenset({"password", "autojoin"})
 
 
 def _autojoin(value) -> dict:
@@ -298,6 +298,7 @@ def _build_network(nname: str, ndata, path: str, parent: UserConfig,
         filled=("name", "servers", "sasl"), keys=("server", "servers", "sasl")))
 
     # One server is written `server: {...}`, several `servers: [{...}, ...]`.
+    reported = len(errors)
     if "server" in ndata and "servers" in ndata:
         errors.append(f"{path}: has both server and servers; keep one")
     elif "servers" in ndata:
@@ -309,20 +310,26 @@ def _build_network(nname: str, ndata, path: str, parent: UserConfig,
             for i, body in enumerate(ndata["servers"]):
                 body = _as_mapping(body, f"{spath}[{i}]", errors)
                 if body is not None:
-                    nc.servers.append(ServerConfig(**_read(
-                        ServerConfig, body, f"{spath}[{i}]", errors)))
+                    nc.servers.append(_build_server(body, f"{spath}[{i}]", errors))
     elif "server" in ndata:
         body = _section(ndata, "server", path, errors)
         if body is not None:
-            nc.servers.append(ServerConfig(**_read(
-                ServerConfig, body, _join(path, "server"), errors)))
-    else:
+            nc.servers.append(_build_server(body, _join(path, "server"), errors))
+    if not nc.servers and len(errors) == reported:
         errors.append(f"{path}: has no server; add server: with at least a host")
 
     sasl = _section(ndata, "sasl", path, errors)
     if sasl is not None:
         nc.sasl = SASLConfig(**_read(SASLConfig, sasl, _join(path, "sasl"), errors))
     return nc
+
+
+def _build_server(body, path: str, errors: list[str]) -> ServerConfig:
+    # ServerConfig defaults the host to localhost, which is a default for
+    # nothing anyone means to write; leaving it out is a mistake.
+    if "host" not in body:
+        errors.append(f"{path}: has no host")
+    return ServerConfig(**_read(ServerConfig, body, path, errors))
 
 
 def _read(cls, raw, path: str, errors: list[str], *, parent=None,
@@ -554,3 +561,26 @@ def _describe(value, secret: bool = False) -> str:
     else:
         kind = shown = type(value).__name__
     return kind if secret else shown
+
+
+def _field_names(cls) -> set[str]:
+    return {f.name for f in fields(cls)}
+
+
+def _check_name_tables() -> None:
+    """The tables above name fields by string; a misspelt or renamed entry would
+    silently stop a setting cascading, or start echoing a secret.  Checked at
+    import, so the mistake cannot survive the first run."""
+    every = set().union(*(_field_names(c) for c in (
+        BouncerConfig, UserConfig, NetworkConfig, ServerConfig, SASLConfig,
+        ListenConfig, LoggingConfig, IdentConfig)))
+    bad = [f"_CASCADING has {n!r}" for n in sorted(_CASCADING)
+           if n not in _field_names(BouncerConfig) or n not in _field_names(UserConfig)]
+    bad += [f"_SECRETS has {n!r}" for n in sorted(_SECRETS) if n not in every]
+    bad += [f"_YAML_FORMS has {n!r}" for n in sorted(_YAML_FORMS)
+            if n not in _field_names(NetworkConfig)]
+    if bad:
+        raise RuntimeError("config.py names fields that do not exist: " + "; ".join(bad))
+
+
+_check_name_tables()
