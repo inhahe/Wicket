@@ -14,7 +14,7 @@ import ssl
 import sys
 from typing import Optional
 
-from config import BouncerConfig, NetworkConfig, UserConfig, set_user_password
+from config import CASCADING, BouncerConfig, NetworkConfig, UserConfig, set_user_password
 from database import Database
 from ident import IdentServer
 from downstream import DownstreamConnection
@@ -23,17 +23,51 @@ from user import User
 
 logger = logging.getLogger(__name__)
 
-# Top-level settings that only startup reads: the listening socket, the
-# database, the ident server, and the server name each User is built with.
-_RESTART_ONLY = frozenset({"listen", "database", "ident", "server_name"})
+# When REHASH applies each setting.  Every field of BouncerConfig and
+# NetworkConfig must be in exactly one place below (checked at import), so a
+# new setting cannot be added without deciding this.
 
-# Network settings used only while connecting and registering.  The rest act
-# from the moment REHASH copies them (rate_limit_ms and auto_connect with
-# work of their own).
+# Top level: read only at startup -- the listening socket, the database, the
+# ident server, and the server name each User is built with.
+_RESTART_ONLY = frozenset({"listen", "database", "ident", "server_name"})
+# Top level: read at the moment of use.  (The rest are CASCADING defaults,
+# applied through the users and networks they reach, plus users and logging.)
+_TOP_APPLIED_NOW = frozenset({"motd"})
+
+# Network: used only while connecting and registering.
 _NETWORK_ON_RECONNECT = frozenset({
     "servers", "nick", "alt_nicks", "user", "ident_username", "realname",
     "password", "sasl", "caps_wanted", "upstream_caps",
 })
+# Network: read at the moment of use, so in effect once copied.
+_NETWORK_APPLIED_NOW = frozenset({
+    "autojoin", "unclean_reconnect_delay", "downstream_caps", "replay_activity",
+    "replay_activity_target", "channel_replay_activity",
+    "rate_limit_ms", "auto_connect",
+})
+# ... of which these take work of their own to apply.
+_NETWORK_ACTED_ON = frozenset({"rate_limit_ms", "auto_connect"})
+
+
+def _check_rehash_tables() -> None:
+    def names(cls):
+        return {f.name for f in dataclasses.fields(cls)}
+
+    def mismatch(cls, listed):
+        missing, extra = names(cls) - listed, listed - names(cls)
+        return [f"{cls.__name__}: unclassified {sorted(missing)}"] * bool(missing) + \
+               [f"{cls.__name__}: no such field {sorted(extra)}"] * bool(extra)
+
+    bad = mismatch(BouncerConfig, _RESTART_ONLY | _TOP_APPLIED_NOW | CASCADING
+                   | {"users", "logging"})
+    bad += mismatch(NetworkConfig, _NETWORK_ON_RECONNECT | _NETWORK_APPLIED_NOW | {"name"})
+    if _NETWORK_ON_RECONNECT & _NETWORK_APPLIED_NOW or not _NETWORK_ACTED_ON <= _NETWORK_APPLIED_NOW:
+        bad.append("a network field is classified twice")
+    if bad:
+        raise RuntimeError("bouncer.py's REHASH tables do not match the config: " + "; ".join(bad))
+
+
+_check_rehash_tables()
 
 
 class Bouncer:
@@ -195,9 +229,12 @@ class Bouncer:
         says.  The exception is _RESTART_ONLY, kept at its running value so
         that every REHASH until the restart still reports it as pending.
         """
+        # Logging is set up again on every REHASH, changed or not: that is what
+        # reopens the log file after rotation (SIGHUP), and what retries a
+        # setup that failed last time.  Only a change in the file is reported.
+        _setup_logging(new_config, self._cli_args)
         if new_config.logging != self.config.logging:
             self.config.logging = new_config.logging
-            _setup_logging(new_config, self._cli_args)
             messages.append("Logging configuration reloaded")
 
         for f in dataclasses.fields(BouncerConfig):
@@ -208,10 +245,11 @@ class Bouncer:
                 continue
             if f.name in _RESTART_ONLY:
                 messages.append(f"{f.name} changed (takes effect when Wicket restarts)")
-            else:
-                # A cascading default; the loader has already applied it to
-                # every user and network it reaches, which report it below.
-                setattr(self.config, f.name, new)
+                continue
+            setattr(self.config, f.name, new)
+            # A cascading default is reported by the users and networks it reaches.
+            if f.name not in CASCADING:
+                messages.append(f"{f.name} updated")
 
         # Process users
         for uname, new_ucfg in new_config.users.items():
@@ -262,23 +300,28 @@ class Bouncer:
                 changed = [f.name for f in dataclasses.fields(NetworkConfig)
                            if getattr(old_ncfg, f.name) != getattr(new_ncfg, f.name)]
                 # The upstream reads its config when it next connects
-                # (UpstreamConnection._start_fresh), so copying is applying.
+                # (UpstreamConnection._start_fresh), so copying is applying --
+                # except for the two with work of their own, recorded only once
+                # that work is done, so a REHASH that fails partway leaves them
+                # different and the next one tries again.
                 for name in changed:
-                    setattr(old_ncfg, name, getattr(new_ncfg, name))
+                    if name not in _NETWORK_ACTED_ON:
+                        setattr(old_ncfg, name, getattr(new_ncfg, name))
                 upstream = user.upstreams.get(nname)
 
                 on_reconnect = [n for n in changed if n in _NETWORK_ON_RECONNECT]
                 if on_reconnect:
                     messages.append(f"{uname}/{nname}: {', '.join(on_reconnect)} "
                                     f"changed (takes effect on reconnect)")
-                live = [n for n in changed if n not in _NETWORK_ON_RECONNECT
-                        and n not in ("rate_limit_ms", "auto_connect")]
+                live = [n for n in changed if n in _NETWORK_APPLIED_NOW
+                        and n not in _NETWORK_ACTED_ON]
                 if live:
                     messages.append(f"{uname}/{nname}: {', '.join(live)} updated")
 
                 if "rate_limit_ms" in changed:
                     if upstream and upstream.rate_limiter and upstream.connected:
                         await upstream.update_rate_limit(new_ncfg.rate_limit_ms)
+                    old_ncfg.rate_limit_ms = new_ncfg.rate_limit_ms
                     messages.append(f"{uname}/{nname}: rate_limit_ms changed to {new_ncfg.rate_limit_ms}")
 
                 # auto_connect is applied live, not just remembered for the next
@@ -301,6 +344,7 @@ class Bouncer:
                     else:
                         await upstream.disconnect("auto_connect disabled")
                         messages.append(f"{uname}/{nname}: auto_connect disabled, disconnected")
+                    old_ncfg.auto_connect = new_ncfg.auto_connect
 
         # Warn about removed users (don't disconnect them)
         for uname in list(self.users.keys()):
@@ -439,17 +483,21 @@ class Bouncer:
 
 
 def _setup_logging(config: BouncerConfig, args) -> None:
-    """Configure logging from config file and CLI overrides."""
-    log_cfg = config.logging
+    """Configure logging from the config file and the command line.
 
-    # CLI -v flags override config level
-    if args.verbose >= 2:
-        level = logging.DEBUG
-        log_cfg.log_irc = True
-    elif args.verbose == 1:
+    args: the parsed command line (`verbose`, `log_file`), or None for none.
+    """
+    log_cfg = config.logging
+    verbose = args.verbose if args else 0
+    # The CLI overrides are applied here, never written into `config`: REHASH
+    # compares it with the file to decide whether logging changed.
+    log_irc = log_cfg.log_irc or verbose >= 2
+
+    # -v and -vv override the configured level
+    if verbose >= 1:
         level = logging.DEBUG
     else:
-        level = getattr(logging, log_cfg.level.upper(), logging.INFO)
+        level = getattr(logging, log_cfg.level.upper())
 
     # Reconfigure root logger
     root = logging.getLogger()
@@ -469,7 +517,7 @@ def _setup_logging(config: BouncerConfig, args) -> None:
     root.addHandler(stderr_handler)
 
     # Log file (CLI overrides config)
-    log_file = args.log_file or log_cfg.file
+    log_file = (args.log_file if args else None) or log_cfg.file
     if log_file:
         file_handler = logging.handlers.RotatingFileHandler(
             log_file,
@@ -483,7 +531,7 @@ def _setup_logging(config: BouncerConfig, args) -> None:
 
     # If IRC traffic logging is off, silence the irc_traffic logger
     irc_traffic_logger = logging.getLogger("irc_traffic")
-    if not log_cfg.log_irc:
+    if not log_irc:
         irc_traffic_logger.setLevel(logging.WARNING)
     else:
         irc_traffic_logger.setLevel(logging.DEBUG)

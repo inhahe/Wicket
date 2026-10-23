@@ -232,7 +232,7 @@ class ConfigError(ValueError):
 # rather than derived from the fields the levels share, because a shared name is
 # not a shared meaning: a user's `password` logs in to Wicket, a network's is the
 # PASS sent to its server.
-_CASCADING = frozenset({
+CASCADING = frozenset({
     "nick", "alt_nicks", "user", "ident_username", "realname",
     "delivery", "delivery_source", "auto_connect", "rate_limit_ms",
     "unclean_reconnect_delay", "caps_wanted", "upstream_caps",
@@ -337,7 +337,7 @@ def _read(cls, raw, path: str, errors: list[str], *, parent=None,
     """Keyword arguments for `cls` from the YAML section `raw`, every value checked.
 
     path: the section's dotted name in messages ("" for the top level).
-    parent: the enclosing level's config.  A _CASCADING field `raw` does not
+    parent: the enclosing level's config.  A CASCADING field `raw` does not
         set takes its value from there; any other field it does not set is left
         out, so the dataclass default applies.
     filled: fields the caller fills itself (nested sections, a user's name).
@@ -358,7 +358,7 @@ def _read(cls, raw, path: str, errors: list[str], *, parent=None,
                       secret=name in _SECRETS):
                 value = _canonical(value, accepted)
                 out[name] = convert(value) if convert else value
-        elif parent is not None and name in _CASCADING and hasattr(parent, name):
+        elif parent is not None and name in CASCADING and hasattr(parent, name):
             out[name] = getattr(parent, name)
 
     allowed = (set(hints) - set(filled)) | set(keys)
@@ -574,7 +574,7 @@ def _check_name_tables() -> None:
     every = set().union(*(_field_names(c) for c in (
         BouncerConfig, UserConfig, NetworkConfig, ServerConfig, SASLConfig,
         ListenConfig, LoggingConfig, IdentConfig)))
-    bad = [f"_CASCADING has {n!r}" for n in sorted(_CASCADING)
+    bad = [f"CASCADING has {n!r}" for n in sorted(CASCADING)
            if n not in _field_names(BouncerConfig) or n not in _field_names(UserConfig)]
     bad += [f"_SECRETS has {n!r}" for n in sorted(_SECRETS) if n not in every]
     bad += [f"_YAML_FORMS has {n!r}" for n in sorted(_YAML_FORMS)

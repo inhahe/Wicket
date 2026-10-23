@@ -704,7 +704,9 @@ changes without dropping connections. If the file cannot be loaded,
 configuration stays.
 
 Every changed setting is taken over, and `REHASH` lists each one.
-They differ only in when they take effect.
+They differ only in when they take effect. Every `REHASH` also reopens
+the log file, so after rotating it away (`SIGHUP` on Unix) Wicket
+writes to a fresh one.
 
 **Applied immediately:**
 
