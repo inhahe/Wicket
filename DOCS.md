@@ -266,6 +266,14 @@ users:
           - "#python"
 ```
 
+Every value is checked when the file is loaded, at startup and on
+`REHASH`. A value of the wrong type stops the load with a message
+naming the key, such as
+`realname: should be text, but YAML read it as a mapping`. YAML gives
+some unquoted text a meaning of its own: `{...}` is a mapping, `[...]`
+a list, `0123` the number 123, `1e3` the number 1000, and `true` a
+boolean. Put such text in quotes: `realname: "{I'm an OP}"`.
+
 ### Top-level keys
 
 | Key | Type | Default | Notes |
@@ -667,7 +675,8 @@ in-memory password still updates and a warning is logged.
 ## Live rehash
 
 `REHASH` (or `SIGHUP` on Unix) reloads `config.yaml` and applies
-changes without dropping connections.
+changes without dropping connections. If the file has errors, `REHASH`
+lists them and changes nothing; the running configuration stays.
 
 **Safe changes** (applied immediately):
 

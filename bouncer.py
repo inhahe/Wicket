@@ -106,16 +106,25 @@ class Bouncer:
         # Connect to upstream networks (after successful bind so we don't
         # spam connect/disconnect on networks if the listen port is in use)
         connect_tasks = []
+        connect_names = []
         for uname, user in self.users.items():
             for nname, nconf in user.config.networks.items():
                 upstream = UpstreamConnection(user, nconf, self.ident_server)
                 user.upstreams[nname] = upstream
                 if nconf.auto_connect:
                     connect_tasks.append(upstream.connect())
+                    connect_names.append((uname, nname))
                     logger.info("Connecting to %s for %s", nname, uname)
 
         if connect_tasks:
-            await asyncio.gather(*connect_tasks, return_exceptions=True)
+            # return_exceptions keeps one network's failure from cancelling the
+            # others' connects -- but it also hands the exception back instead
+            # of raising it, so nothing would report it unless this does.
+            results = await asyncio.gather(*connect_tasks, return_exceptions=True)
+            for (uname, nname), result in zip(connect_names, results):
+                if isinstance(result, Exception):
+                    logger.error("Connecting to %s for %s failed", nname, uname,
+                                 exc_info=result)
 
         # Serve until cancelled
         async with self._server:
@@ -147,9 +156,11 @@ class Bouncer:
         try:
             new_config = BouncerConfig.load(self.config_path)
         except Exception as e:
-            msg = f"Failed to reload config: {e}"
+            msg = f"Failed to reload config, nothing was changed: {e}"
             logger.error(msg)
-            return [msg]
+            # One entry per line: each entry becomes one NOTICE, and a YAML
+            # parse error or a ConfigError spans several lines.
+            return msg.splitlines()
 
         messages = []
 

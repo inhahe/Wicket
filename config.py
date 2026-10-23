@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+import types
+import typing
 from typing import Optional
 from ruamel.yaml import YAML
+from ruamel.yaml.scalarbool import ScalarBoolean
 import bcrypt
 
 _yaml = YAML()
@@ -183,6 +186,10 @@ class BouncerConfig:
         if not isinstance(raw, dict):  # CommentedMap is a dict subclass
             raise ValueError("Config must be a YAML mapping")
 
+        errors = _validate_raw(raw)
+        if errors:
+            raise ConfigError(errors)
+
         config = BouncerConfig()
 
         # Listen section
@@ -314,19 +321,16 @@ class BouncerConfig:
                         # Parse autojoin: supports both list and dict formats
                         # List: ["#chan1", "#chan2"]
                         # Dict: {"#chan1": null, "#chan2": "key"}
-                        raw_autojoin = ndata.get("autojoin", {})
+                        # Empty: no channels
+                        raw_autojoin = ndata.get("autojoin") or {}
                         if isinstance(raw_autojoin, list):
                             autojoin = {ch: None for ch in raw_autojoin}
-                        elif isinstance(raw_autojoin, dict):
-                            autojoin = raw_autojoin
                         else:
-                            autojoin = {}
+                            autojoin = raw_autojoin
 
                         # Parse channel_replay_activity overrides
-                        raw_chan_activity = ndata.get("channel_replay_activity", {})
-                        chan_activity = {}
-                        if isinstance(raw_chan_activity, dict):
-                            chan_activity = {k.lower(): bool(v) for k, v in raw_chan_activity.items()}
+                        chan_activity = {k.lower(): v for k, v in
+                                         ndata.get("channel_replay_activity", {}).items()}
 
                         # Network overrides user-level defaults
                         nc = NetworkConfig(
@@ -355,3 +359,179 @@ class BouncerConfig:
                 config.users[uname] = uc
 
         return config
+
+
+# --- Validation ---------------------------------------------------------------
+#
+# `load` stores what YAML produced without converting it, and the values travel
+# a long way before anything uses them: a realname ends up as the last
+# parameter of USER, a port in open_connection.  A value of the wrong type
+# therefore fails far from the file -- a realname written `{...}` (a YAML
+# mapping) raises while serialising USER, on every connect to every network,
+# after NICK has already gone out.  The dataclass annotations already say what
+# each key holds, so the raw YAML is checked against them before anything is
+# built, and the error names the key.
+
+
+class ConfigError(ValueError):
+    """The file is valid YAML, but some values are not what their keys hold.
+
+    `errors` is one line per problem, each naming the key by its dotted path.
+    """
+
+    def __init__(self, errors: list[str]):
+        self.errors = errors
+        noun = "problem" if len(errors) == 1 else "problems"
+        super().__init__("\n".join(
+            [f"{len(errors)} {noun} in the config:"] + ["  " + e for e in errors]))
+
+
+# A network's autojoin is written by hand as a list or a mapping, and by
+# `update_autojoin` as a mapping; an empty key means no channels.
+_AUTOJOIN = list[str] | dict[str, str | None] | None
+
+
+def _is_bool(value) -> bool:
+    # ruamel loads an anchored boolean as ScalarBoolean, which subclasses int.
+    return isinstance(value, (bool, ScalarBoolean))
+
+
+def _matches(value, hint) -> bool:
+    """Whether `value`, as YAML loaded it, is acceptable for a field annotated `hint`."""
+    origin = typing.get_origin(hint)
+    if origin is typing.Union or origin is types.UnionType:
+        return any(_matches(value, arm) for arm in typing.get_args(hint))
+    if hint is type(None):
+        return value is None
+    if hint is bool:
+        return _is_bool(value)
+    if hint is int:
+        return isinstance(value, int) and not _is_bool(value)
+    if hint is float:
+        return isinstance(value, (int, float)) and not _is_bool(value)
+    if hint is str:
+        return isinstance(value, str)
+    if origin is list:
+        (item,) = typing.get_args(hint)
+        return isinstance(value, list) and all(_matches(v, item) for v in value)
+    if origin is dict:
+        key, val = typing.get_args(hint)
+        return isinstance(value, dict) and all(
+            _matches(k, key) and _matches(v, val) for k, v in value.items())
+    raise TypeError(f"no rule for checking a config value against {hint!r}")
+
+
+def _expected(hint) -> str:
+    """`hint` in the words of someone editing the file."""
+    origin = typing.get_origin(hint)
+    if origin is typing.Union or origin is types.UnionType:
+        arms = typing.get_args(hint)
+        text = " or ".join(_expected(a) for a in arms if a is not type(None))
+        return text + " (or empty)" if type(None) in arms else text
+    if origin is list:
+        return "a list of " + _expected(typing.get_args(hint)[0])
+    if origin is dict:
+        key, val = typing.get_args(hint)
+        return f"a mapping of {_expected(key)} to {_expected(val)}"
+    return {str: "text", int: "a whole number", float: "a number",
+            bool: "true or false"}[hint]
+
+
+def _describe(value) -> str:
+    """What YAML made of `value`, in the words of someone editing the file."""
+    if value is None:
+        return "nothing (the key is empty)"
+    if _is_bool(value):
+        return f"the boolean {str(bool(value)).lower()}"
+    if isinstance(value, (int, float)):
+        return f"the number {value}"
+    if isinstance(value, str):
+        return f"the text {value!r}"
+    if isinstance(value, dict):
+        return "a mapping with the keys " + ", ".join(repr(str(k)) for k in value)
+    if isinstance(value, list):
+        return f"a list of {len(value)} items"
+    return type(value).__name__
+
+
+def _mismatch(path: str, value, hint) -> str:
+    msg = f"{path}: should be {_expected(hint)}, but YAML read it as {_describe(value)}"
+    if value is not None and _matches("", hint):
+        # Text would have been accepted; the value is something else only
+        # because YAML gave unquoted { } [ ], numbers and true/false a meaning.
+        msg += "; put the value in quotes to keep it as text"
+    return msg
+
+
+def _as_mapping(value, path: str, errors: list[str]):
+    """`value` if it is a mapping; otherwise None, with the problem reported."""
+    if isinstance(value, dict):
+        return value
+    errors.append(f"{path}: should be a mapping of settings, "
+                  f"but YAML read it as {_describe(value)}")
+    return None
+
+
+def _check_mapping(raw, cls, path: str, errors: list[str], skip=frozenset()) -> None:
+    """Check every key `raw` sets that is a field of `cls` against the field's type.
+
+    raw: one section of the YAML -- the top level, a user, a network, a server.
+    cls: the dataclass that section is loaded into; its annotations are the schema.
+    path: dotted prefix naming `raw` in messages, e.g. "users.alice.networks.libera.".
+    skip: fields the section does not hold as a plain value -- nested sections the
+        caller checks itself, and fields filled from elsewhere (a user's `username`
+        is its key under `users`).
+    """
+    for name, hint in typing.get_type_hints(cls).items():
+        if name in skip or name not in raw:
+            continue
+        if not _matches(raw[name], hint):
+            errors.append(_mismatch(path + name, raw[name], hint))
+
+
+def _validate_raw(raw) -> list[str]:
+    """Every problem with the shape of the loaded YAML `raw`, one line each.
+
+    It mirrors the walk `BouncerConfig.load` makes, so that `load` may assume
+    every section it reads is a mapping and every value has its field's type.
+    """
+    errors: list[str] = []
+    _check_mapping(raw, BouncerConfig, "", errors,
+                   skip={"listen", "logging", "ident", "users"})
+    for key, cls in (("listen", ListenConfig), ("logging", LoggingConfig),
+                     ("ident", IdentConfig)):
+        if key in raw and _as_mapping(raw[key], key, errors) is not None:
+            _check_mapping(raw[key], cls, key + ".", errors)
+
+    users = _as_mapping(raw["users"], "users", errors) if "users" in raw else None
+    for uname, udata in (users or {}).items():
+        upath = f"users.{uname}"
+        if _as_mapping(udata, upath, errors) is None:
+            continue
+        _check_mapping(udata, UserConfig, upath + ".", errors,
+                       skip={"username", "networks"})
+        networks = (_as_mapping(udata["networks"], upath + ".networks", errors)
+                    if "networks" in udata else None)
+        for nname, ndata in (networks or {}).items():
+            npath = f"{upath}.networks.{nname}"
+            if _as_mapping(ndata, npath, errors) is None:
+                continue
+            _check_mapping(ndata, NetworkConfig, npath + ".", errors,
+                           skip={"name", "servers", "sasl", "autojoin"})
+            if "autojoin" in ndata and not _matches(ndata["autojoin"], _AUTOJOIN):
+                errors.append(_mismatch(npath + ".autojoin", ndata["autojoin"], _AUTOJOIN))
+            if "sasl" in ndata and _as_mapping(ndata["sasl"], npath + ".sasl", errors) is not None:
+                _check_mapping(ndata["sasl"], SASLConfig, npath + ".sasl.", errors)
+            if "server" in ndata and _as_mapping(ndata["server"], npath + ".server", errors) is not None:
+                _check_mapping(ndata["server"], ServerConfig, npath + ".server.", errors)
+            if "servers" in ndata:
+                servers = ndata["servers"]
+                if not isinstance(servers, list):
+                    errors.append(f"{npath}.servers: should be a list of servers, "
+                                  f"but YAML read it as {_describe(servers)}")
+                    continue
+                for i, sc_data in enumerate(servers):
+                    spath = f"{npath}.servers[{i}]"
+                    if _as_mapping(sc_data, spath, errors) is not None:
+                        _check_mapping(sc_data, ServerConfig, spath + ".", errors)
+    return errors
