@@ -68,7 +68,7 @@ server_name: "wicket"
 # replay_activity_target: "channel" # "channel" (deliver into the channel window) or "bouncer" (into *wicket / server window)
 
 logging:
-  level: "info"            # debug, info, warning, error
+  level: "info"            # debug, info, warning, error, critical
   # file: "/var/log/wicket.log"  # omit for stderr only
   # max_bytes: 10000000    # 10 MB, rotate when exceeded
   # backup_count: 5        # keep 5 rotated log files

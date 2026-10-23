@@ -145,25 +145,46 @@ class Bouncer:
 
         task.add_done_callback(_finished)
 
-    async def rehash(self, requesting_ds=None) -> list[str]:
+    async def rehash(self, requesting_ds=None) -> tuple[bool, list[str]]:
         """Reload config from disk and apply safe changes.
 
-        Returns list of status messages.
+        Returns whether the reload went through, and the status messages to
+        show, one line each: each becomes one NOTICE, so none may contain a
+        line break.
         """
         if not self.config_path:
-            return ["No config path available for rehash"]
+            return False, ["No config path available for rehash"]
 
         try:
             new_config = BouncerConfig.load(self.config_path)
         except Exception as e:
             msg = f"Failed to reload config, nothing was changed: {e}"
             logger.error(msg)
-            # One entry per line: each entry becomes one NOTICE, and a YAML
-            # parse error or a ConfigError spans several lines.
-            return msg.splitlines()
+            # A YAML parse error or a ConfigError spans several lines.
+            return False, msg.splitlines()
 
-        messages = []
+        messages: list[str] = []
+        try:
+            await self._apply_config(new_config, messages)
+        except Exception as e:
+            logger.exception("Rehash failed while applying the new config")
+            messages.append(f"Rehash failed partway through: {e}")
+            messages.append("Changes listed above were applied; the rest were not. "
+                            "See the log for details.")
+            return False, messages
 
+        if not messages:
+            messages.append("No changes detected")
+
+        logger.info("Rehash complete: %d changes", len(messages))
+        for msg in messages:
+            logger.info("  Rehash: %s", msg)
+
+        return True, messages
+
+    async def _apply_config(self, new_config: BouncerConfig, messages: list[str]) -> None:
+        """Apply the safe changes in `new_config` to the running bouncer,
+        appending a line to `messages` for each."""
         # Update logging
         self.config.logging = new_config.logging
         _setup_logging(new_config, self._cli_args)
@@ -300,15 +321,6 @@ class Bouncer:
         for uname in list(self.users.keys()):
             if uname not in new_config.users:
                 messages.append(f"{uname}: removed from config (still active until restart)")
-
-        if not messages:
-            messages.append("No changes detected")
-
-        logger.info("Rehash complete: %d changes", len(messages))
-        for msg in messages:
-            logger.info("  Rehash: %s", msg)
-
-        return messages
 
     async def shutdown(self) -> None:
         """Gracefully shut down the bouncer.

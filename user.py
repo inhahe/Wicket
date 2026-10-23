@@ -1664,10 +1664,10 @@ class User:
         """Handle the REHASH bouncer command."""
         bouncer = ds.bouncer
         self.deliver_bouncer_message(ds, "Reloading configuration...")
-        messages = await bouncer.rehash(requesting_ds=ds)
+        ok, messages = await bouncer.rehash(requesting_ds=ds)
         for msg in messages:
             self.deliver_bouncer_message(ds, f"  {msg}")
-        self.deliver_bouncer_message(ds, "Rehash complete")
+        self.deliver_bouncer_message(ds, "Rehash complete" if ok else "Rehash failed")
 
     async def _handle_activity(self, ds: DownstreamConnection, args: list[str]) -> None:
         """Handle the ACTIVITY bouncer command.

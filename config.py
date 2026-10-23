@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+import datetime
+import difflib
+import functools
 import types
 import typing
-from typing import Optional
+from typing import Literal, Optional
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarbool import ScalarBoolean
 import bcrypt
@@ -59,7 +62,7 @@ def update_autojoin(config_path: str, username: str, network: str, channels: dic
 
 @dataclass
 class SASLConfig:
-    mechanism: str = "PLAIN"
+    mechanism: Literal["PLAIN", "EXTERNAL"] = "PLAIN"
     username: str = ""
     password: str = ""
     cert_path: Optional[str] = None  # For EXTERNAL
@@ -101,7 +104,7 @@ class NetworkConfig:
     upstream_caps: Optional[list[str]] = None  # Full override for upstream caps (None = use defaults)
     downstream_caps: Optional[list[str]] = None  # Full override for downstream caps (None = use defaults)
     replay_activity: bool = False  # Auto-send activity (JOIN/PART/KICK/MODE/NICK/QUIT) on connect
-    replay_activity_target: str = "channel"  # "channel" or "bouncer" — where to send replayed activity lines
+    replay_activity_target: Literal["channel", "bouncer"] = "channel"  # where to send replayed activity lines
     channel_replay_activity: dict[str, bool] = field(default_factory=dict)  # Per-channel overrides
 
 
@@ -121,10 +124,10 @@ class UserConfig:
     upstream_caps: Optional[list[str]] = None  # Full override for upstream caps
     downstream_caps: Optional[list[str]] = None  # Full override for downstream caps
     replay_activity: bool = False  # Default replay_activity for all networks
-    replay_activity_target: str = "channel"  # Default target for all networks
+    replay_activity_target: Literal["channel", "bouncer"] = "channel"  # Default target for all networks
     networks: dict[str, NetworkConfig] = field(default_factory=dict)
-    delivery: str = "notice"  # "notice" or "privmsg"
-    delivery_source: str = "*wicket"  # "*wicket" or "server"
+    delivery: Literal["notice", "privmsg"] = "notice"
+    delivery_source: str = "*wicket"  # "server", or the nick bouncer messages come from
 
 
 @dataclass
@@ -138,7 +141,7 @@ class ListenConfig:
 
 @dataclass
 class LoggingConfig:
-    level: str = "info"  # debug, info, warning, error
+    level: Literal["debug", "info", "warning", "error", "critical"] = "info"
     file: Optional[str] = None  # Log file path (None = stderr only)
     max_bytes: int = 10_000_000  # 10 MB default for rotation
     backup_count: int = 5  # Number of rotated log files to keep
@@ -167,7 +170,7 @@ class BouncerConfig:
     user: str = ""  # defaults to username if empty
     ident_username: str = ""  # defaults to user if empty
     realname: str = "Wicket User"
-    delivery: str = "notice"
+    delivery: Literal["notice", "privmsg"] = "notice"
     delivery_source: str = "*wicket"
     caps_wanted: list[str] = field(default_factory=list)
     upstream_caps: Optional[list[str]] = None
@@ -176,291 +179,199 @@ class BouncerConfig:
     unclean_reconnect_delay: float = 240.0
     auto_connect: bool = True
     replay_activity: bool = False
-    replay_activity_target: str = "channel"
+    replay_activity_target: Literal["channel", "bouncer"] = "channel"
 
     @staticmethod
     def load(path: str) -> BouncerConfig:
+        """Read and check the config file at `path`.
+
+        Raises ConfigError listing every problem -- a value that is not what its
+        key holds, a key Wicket does not read -- and builds nothing from a file
+        that has any.
+        """
         with open(path, "r", encoding="utf-8") as f:
             raw = _yaml.load(f)
 
         if not isinstance(raw, dict):  # CommentedMap is a dict subclass
             raise ValueError("Config must be a YAML mapping")
 
-        errors = _validate_raw(raw)
+        errors: list[str] = []
+        config = _build_bouncer(raw, errors)
         if errors:
             raise ConfigError(errors)
-
-        config = BouncerConfig()
-
-        # Listen section
-        if "listen" in raw:
-            ls = raw["listen"]
-            config.listen = ListenConfig(
-                host=ls.get("host", "0.0.0.0"),
-                port=ls.get("port", 6697),
-                tls=ls.get("tls", True),
-                tls_cert=ls.get("tls_cert"),
-                tls_key=ls.get("tls_key"),
-            )
-
-        config.database = raw.get("database", "wicket.db")
-        config.server_name = raw.get("server_name", "wicket")
-        config.motd = raw.get("motd")
-
-        # Top-level defaults for cascading settings
-        config.nick = raw.get("nick", "")
-        config.alt_nicks = raw.get("alt_nicks", [])
-        config.user = raw.get("user", "")
-        config.ident_username = raw.get("ident_username", "")
-        config.realname = raw.get("realname", "Wicket User")
-        config.delivery = raw.get("delivery", "notice")
-        config.delivery_source = raw.get("delivery_source", "*wicket")
-        config.caps_wanted = raw.get("caps_wanted", [])
-        config.rate_limit_ms = raw.get("rate_limit_ms", 500)
-        config.unclean_reconnect_delay = raw.get("unclean_reconnect_delay", 240.0)
-        config.upstream_caps = raw.get("upstream_caps")
-        config.downstream_caps = raw.get("downstream_caps")
-        config.auto_connect = raw.get("auto_connect", True)
-        config.replay_activity = raw.get("replay_activity", False)
-        config.replay_activity_target = raw.get("replay_activity_target", "channel")
-
-        # Logging section
-        if "logging" in raw:
-            lg = raw["logging"]
-            config.logging = LoggingConfig(
-                level=lg.get("level", "info"),
-                file=lg.get("file"),
-                max_bytes=lg.get("max_bytes", 10_000_000),
-                backup_count=lg.get("backup_count", 5),
-                log_irc=lg.get("log_irc", False),
-            )
-
-        # Ident section
-        if "ident" in raw:
-            id_cfg = raw["ident"]
-            config.ident = IdentConfig(
-                enabled=id_cfg.get("enabled", False),
-                host=id_cfg.get("host", "0.0.0.0"),
-                port=id_cfg.get("port", 113),
-            )
-
-        # Users section
-        if "users" in raw:
-            for uname, udata in raw["users"].items():
-                # User-level defaults cascade from top-level
-                # nick/user default to username if neither user nor top-level sets them
-                user_nick = udata.get("nick", config.nick or uname)
-                user_alt_nicks = udata.get("alt_nicks", config.alt_nicks)
-                user_user = udata.get("user", config.user or uname)
-                user_ident = udata.get("ident_username", config.ident_username)
-                user_realname = udata.get("realname", config.realname)
-                user_auto_connect = udata.get("auto_connect", config.auto_connect)
-                user_rate_limit_ms = udata.get("rate_limit_ms", config.rate_limit_ms)
-                user_unclean_reconnect_delay = udata.get("unclean_reconnect_delay", config.unclean_reconnect_delay)
-                user_caps_wanted = udata.get("caps_wanted", config.caps_wanted)
-                user_delivery = udata.get("delivery", config.delivery)
-                user_delivery_source = udata.get("delivery_source", config.delivery_source)
-                user_upstream_caps = udata.get("upstream_caps", config.upstream_caps)
-                user_downstream_caps = udata.get("downstream_caps", config.downstream_caps)
-                user_replay_activity = udata.get("replay_activity", config.replay_activity)
-                user_replay_activity_target = udata.get("replay_activity_target", config.replay_activity_target)
-
-                uc = UserConfig(
-                    username=uname,
-                    password=udata.get("password", ""),
-                    nick=user_nick,
-                    alt_nicks=user_alt_nicks,
-                    user=user_user,
-                    ident_username=user_ident,
-                    realname=user_realname,
-                    auto_connect=user_auto_connect,
-                    rate_limit_ms=user_rate_limit_ms,
-                    unclean_reconnect_delay=user_unclean_reconnect_delay,
-                    caps_wanted=user_caps_wanted,
-                    delivery=user_delivery,
-                    delivery_source=user_delivery_source,
-                    upstream_caps=user_upstream_caps,
-                    downstream_caps=user_downstream_caps,
-                    replay_activity=user_replay_activity,
-                    replay_activity_target=user_replay_activity_target,
-                )
-
-                if "networks" in udata:
-                    for nname, ndata in udata["networks"].items():
-                        # Parse servers: supports "server" (single) or "servers" (list)
-                        servers: list[ServerConfig] = []
-                        if "servers" in ndata:
-                            for sc_data in ndata["servers"]:
-                                servers.append(ServerConfig(
-                                    host=sc_data.get("host", "localhost"),
-                                    port=sc_data.get("port", 6697),
-                                    tls=sc_data.get("tls", True),
-                                    tls_verify=sc_data.get("tls_verify", True),
-                                    password=sc_data.get("password"),
-                                ))
-                        elif "server" in ndata:
-                            sc_data = ndata["server"]
-                            servers.append(ServerConfig(
-                                host=sc_data.get("host", "localhost"),
-                                port=sc_data.get("port", 6697),
-                                tls=sc_data.get("tls", True),
-                                tls_verify=sc_data.get("tls_verify", True),
-                                password=sc_data.get("password"),
-                            ))
-
-                        sasl = None
-                        if "sasl" in ndata:
-                            sd = ndata["sasl"]
-                            sasl = SASLConfig(
-                                mechanism=sd.get("mechanism", "PLAIN"),
-                                username=sd.get("username", ""),
-                                password=sd.get("password", ""),
-                                cert_path=sd.get("cert_path"),
-                            )
-
-                        # Parse autojoin: supports both list and dict formats
-                        # List: ["#chan1", "#chan2"]
-                        # Dict: {"#chan1": null, "#chan2": "key"}
-                        # Empty: no channels
-                        raw_autojoin = ndata.get("autojoin") or {}
-                        if isinstance(raw_autojoin, list):
-                            autojoin = {ch: None for ch in raw_autojoin}
-                        else:
-                            autojoin = raw_autojoin
-
-                        # Parse channel_replay_activity overrides
-                        chan_activity = {k.lower(): v for k, v in
-                                         ndata.get("channel_replay_activity", {}).items()}
-
-                        # Network overrides user-level defaults
-                        nc = NetworkConfig(
-                            name=nname,
-                            servers=servers,
-                            nick=ndata.get("nick", user_nick),
-                            alt_nicks=ndata.get("alt_nicks", user_alt_nicks),
-                            user=ndata.get("user", user_user),
-                            ident_username=ndata.get("ident_username", user_ident),
-                            realname=ndata.get("realname", user_realname),
-                            password=ndata.get("password"),
-                            sasl=sasl,
-                            autojoin=autojoin,
-                            rate_limit_ms=ndata.get("rate_limit_ms", user_rate_limit_ms),
-                            unclean_reconnect_delay=ndata.get("unclean_reconnect_delay", user_unclean_reconnect_delay),
-                            auto_connect=ndata.get("auto_connect", user_auto_connect),
-                            caps_wanted=ndata.get("caps_wanted", user_caps_wanted),
-                            upstream_caps=ndata.get("upstream_caps", user_upstream_caps),
-                            downstream_caps=ndata.get("downstream_caps", user_downstream_caps),
-                            replay_activity=ndata.get("replay_activity", user_replay_activity),
-                            replay_activity_target=ndata.get("replay_activity_target", user_replay_activity_target),
-                            channel_replay_activity=chan_activity,
-                        )
-                        uc.networks[nname] = nc
-
-                config.users[uname] = uc
-
         return config
 
 
-# --- Validation ---------------------------------------------------------------
+# --- Loading ------------------------------------------------------------------
 #
-# `load` stores what YAML produced without converting it, and the values travel
-# a long way before anything uses them: a realname ends up as the last
-# parameter of USER, a port in open_connection.  A value of the wrong type
-# therefore fails far from the file -- a realname written `{...}` (a YAML
-# mapping) raises while serialising USER, on every connect to every network,
-# after NICK has already gone out.  The dataclass annotations already say what
-# each key holds, so the raw YAML is checked against them before anything is
-# built, and the error names the key.
+# The dataclasses above are the schema: a field's annotation says what its key
+# may hold, and its default applies when no level sets it.  Values are stored as
+# given and used far from here, so one of the wrong type would fail at the point
+# of use with nothing naming the key; each is therefore checked as it is read,
+# and so is every key, since a misspelt one would otherwise be silently ignored.
 
 
 class ConfigError(ValueError):
-    """The file is valid YAML, but some values are not what their keys hold.
+    """The file is valid YAML, but some of what it says cannot be used.
 
-    `errors` is one line per problem, each naming the key by its dotted path.
+    `errors` holds one line per problem, each starting with the key's dotted path.
     """
 
     def __init__(self, errors: list[str]):
+        super().__init__(errors)
         self.errors = errors
-        noun = "problem" if len(errors) == 1 else "problems"
-        super().__init__("\n".join(
-            [f"{len(errors)} {noun} in the config:"] + ["  " + e for e in errors]))
+
+    def __str__(self) -> str:
+        noun = "problem" if len(self.errors) == 1 else "problems"
+        return "\n".join([f"{len(self.errors)} {noun} in the config:"]
+                         + ["  " + e for e in self.errors])
 
 
-# A network's autojoin is written by hand as a list or a mapping, and by
-# `update_autojoin` as a mapping; an empty key means no channels.
-_AUTOJOIN = list[str] | dict[str, str | None] | None
+# Settings that cascade: set at the top level or on a user, they apply to every
+# level below that has the same field, unless that level sets its own.  Listed
+# rather than derived from the fields the levels share, because a shared name is
+# not a shared meaning: a user's `password` logs in to Wicket, a network's is the
+# PASS sent to its server.
+_CASCADING = frozenset({
+    "nick", "alt_nicks", "user", "ident_username", "realname",
+    "delivery", "delivery_source", "auto_connect", "rate_limit_ms",
+    "unclean_reconnect_delay", "caps_wanted", "upstream_caps",
+    "downstream_caps", "replay_activity", "replay_activity_target",
+})
+
+# Fields whose values are never repeated in a message.
+_SECRETS = frozenset({"password"})
 
 
-def _is_bool(value) -> bool:
-    # ruamel loads an anchored boolean as ScalarBoolean, which subclasses int.
-    return isinstance(value, (bool, ScalarBoolean))
-
-
-def _matches(value, hint) -> bool:
-    """Whether `value`, as YAML loaded it, is acceptable for a field annotated `hint`."""
-    origin = typing.get_origin(hint)
-    if origin is typing.Union or origin is types.UnionType:
-        return any(_matches(value, arm) for arm in typing.get_args(hint))
-    if hint is type(None):
-        return value is None
-    if hint is bool:
-        return _is_bool(value)
-    if hint is int:
-        return isinstance(value, int) and not _is_bool(value)
-    if hint is float:
-        return isinstance(value, (int, float)) and not _is_bool(value)
-    if hint is str:
-        return isinstance(value, str)
-    if origin is list:
-        (item,) = typing.get_args(hint)
-        return isinstance(value, list) and all(_matches(v, item) for v in value)
-    if origin is dict:
-        key, val = typing.get_args(hint)
-        return isinstance(value, dict) and all(
-            _matches(k, key) and _matches(v, val) for k, v in value.items())
-    raise TypeError(f"no rule for checking a config value against {hint!r}")
-
-
-def _expected(hint) -> str:
-    """`hint` in the words of someone editing the file."""
-    origin = typing.get_origin(hint)
-    if origin is typing.Union or origin is types.UnionType:
-        arms = typing.get_args(hint)
-        text = " or ".join(_expected(a) for a in arms if a is not type(None))
-        return text + " (or empty)" if type(None) in arms else text
-    if origin is list:
-        return "a list of " + _expected(typing.get_args(hint)[0])
-    if origin is dict:
-        key, val = typing.get_args(hint)
-        return f"a mapping of {_expected(key)} to {_expected(val)}"
-    return {str: "text", int: "a whole number", float: "a number",
-            bool: "true or false"}[hint]
-
-
-def _describe(value) -> str:
-    """What YAML made of `value`, in the words of someone editing the file."""
-    if value is None:
-        return "nothing (the key is empty)"
-    if _is_bool(value):
-        return f"the boolean {str(bool(value)).lower()}"
-    if isinstance(value, (int, float)):
-        return f"the number {value}"
-    if isinstance(value, str):
-        return f"the text {value!r}"
-    if isinstance(value, dict):
-        return "a mapping with the keys " + ", ".join(repr(str(k)) for k in value)
+def _autojoin(value) -> dict:
+    """autojoin as written -- a list of channels, a mapping of channel to key,
+    or empty -- as the mapping of channel to key (None for no key)."""
     if isinstance(value, list):
-        return f"a list of {len(value)} items"
-    return type(value).__name__
+        return {ch: None for ch in value}
+    return value or {}
 
 
-def _mismatch(path: str, value, hint) -> str:
-    msg = f"{path}: should be {_expected(hint)}, but YAML read it as {_describe(value)}"
-    if value is not None and _matches("", hint):
-        # Text would have been accepted; the value is something else only
-        # because YAML gave unquoted { } [ ], numbers and true/false a meaning.
-        msg += "; put the value in quotes to keep it as text"
-    return msg
+def _replay_overrides(value) -> dict:
+    """channel_replay_activity as written (or empty), keyed by lowercase channel."""
+    return {k.lower(): v for k, v in (value or {}).items()}
+
+
+# Fields whose YAML form is not the stored form:
+# field name -> (what the key may hold, how to make the stored value from it).
+_YAML_FORMS = {
+    "autojoin": (list[str] | dict[str, str | None] | None, _autojoin),
+    "channel_replay_activity": (dict[str, bool] | None, _replay_overrides),
+}
+
+
+def _build_bouncer(raw, errors: list[str]) -> BouncerConfig:
+    sections = ("listen", "logging", "ident", "users")
+    config = BouncerConfig(**_read(BouncerConfig, raw, "", errors,
+                                   filled=sections, keys=sections))
+    for key, cls in (("listen", ListenConfig), ("logging", LoggingConfig),
+                     ("ident", IdentConfig)):
+        section = _section(raw, key, "", errors)
+        if section is not None:
+            setattr(config, key, cls(**_read(cls, section, key, errors)))
+    for uname, udata, upath in _named(raw, "users", "", errors):
+        config.users[uname] = _build_user(uname, udata, upath, config, errors)
+    return config
+
+
+def _build_user(uname: str, udata, path: str, parent: BouncerConfig,
+                errors: list[str]) -> UserConfig:
+    uc = UserConfig(username=uname, **_read(
+        UserConfig, udata, path, errors, parent=parent,
+        filled=("username", "networks"), keys=("networks",)))
+    # nick and user default to the user's own name when no level sets them.
+    uc.nick = uc.nick or uname
+    uc.user = uc.user or uname
+    for nname, ndata, npath in _named(udata, "networks", path, errors):
+        uc.networks[nname] = _build_network(nname, ndata, npath, uc, errors)
+    return uc
+
+
+def _build_network(nname: str, ndata, path: str, parent: UserConfig,
+                   errors: list[str]) -> NetworkConfig:
+    nc = NetworkConfig(name=nname, **_read(
+        NetworkConfig, ndata, path, errors, parent=parent,
+        filled=("name", "servers", "sasl"), keys=("server", "servers", "sasl")))
+
+    # One server is written `server: {...}`, several `servers: [{...}, ...]`.
+    if "server" in ndata and "servers" in ndata:
+        errors.append(f"{path}: has both server and servers; keep one")
+    elif "servers" in ndata:
+        spath = _join(path, "servers")
+        if not isinstance(ndata["servers"], list):
+            errors.append(f"{spath}: should be a list of servers, "
+                          f"but YAML read it as {_describe(ndata['servers'])}")
+        else:
+            for i, body in enumerate(ndata["servers"]):
+                body = _as_mapping(body, f"{spath}[{i}]", errors)
+                if body is not None:
+                    nc.servers.append(ServerConfig(**_read(
+                        ServerConfig, body, f"{spath}[{i}]", errors)))
+    elif "server" in ndata:
+        body = _section(ndata, "server", path, errors)
+        if body is not None:
+            nc.servers.append(ServerConfig(**_read(
+                ServerConfig, body, _join(path, "server"), errors)))
+    else:
+        errors.append(f"{path}: has no server; add server: with at least a host")
+
+    sasl = _section(ndata, "sasl", path, errors)
+    if sasl is not None:
+        nc.sasl = SASLConfig(**_read(SASLConfig, sasl, _join(path, "sasl"), errors))
+    return nc
+
+
+def _read(cls, raw, path: str, errors: list[str], *, parent=None,
+          filled=(), keys=()) -> dict:
+    """Keyword arguments for `cls` from the YAML section `raw`, every value checked.
+
+    path: the section's dotted name in messages ("" for the top level).
+    parent: the enclosing level's config.  A _CASCADING field `raw` does not
+        set takes its value from there; any other field it does not set is left
+        out, so the dataclass default applies.
+    filled: fields the caller fills itself (nested sections, a user's name).
+    keys: keys of `raw` the caller reads itself.  With the fields not in
+        `filled`, these are all the keys the section may have; any other is
+        reported.
+    A value that does not check out is reported and left out.
+    """
+    hints = _hints(cls)
+    out = {}
+    for name, hint in hints.items():
+        if name in filled:
+            continue
+        if name in raw:
+            accepted, convert = _YAML_FORMS.get(name, (hint, None))
+            value = raw[name]
+            if _check(value, accepted, _join(path, name), errors,
+                      secret=name in _SECRETS):
+                value = _canonical(value, accepted)
+                out[name] = convert(value) if convert else value
+        elif parent is not None and name in _CASCADING and hasattr(parent, name):
+            out[name] = getattr(parent, name)
+
+    allowed = (set(hints) - set(filled)) | set(keys)
+    for key in raw:
+        if key not in allowed:
+            msg = f"{_join(path, str(key))}: not a setting Wicket reads here"
+            close = difflib.get_close_matches(str(key), sorted(allowed), n=1)
+            errors.append(msg + (f"; did you mean {close[0]}?" if close else ""))
+    return out
+
+
+def _join(path: str, name: str) -> str:
+    return f"{path}.{name}" if path else name
+
+
+def _section(raw, key: str, path: str, errors: list[str]):
+    """raw[key] if it is a mapping; None if it is absent, or not a mapping (reported)."""
+    if key not in raw:
+        return None
+    return _as_mapping(raw[key], _join(path, key), errors)
 
 
 def _as_mapping(value, path: str, errors: list[str]):
@@ -472,66 +383,174 @@ def _as_mapping(value, path: str, errors: list[str]):
     return None
 
 
-def _check_mapping(raw, cls, path: str, errors: list[str], skip=frozenset()) -> None:
-    """Check every key `raw` sets that is a field of `cls` against the field's type.
-
-    raw: one section of the YAML -- the top level, a user, a network, a server.
-    cls: the dataclass that section is loaded into; its annotations are the schema.
-    path: dotted prefix naming `raw` in messages, e.g. "users.alice.networks.libera.".
-    skip: fields the section does not hold as a plain value -- nested sections the
-        caller checks itself, and fields filled from elsewhere (a user's `username`
-        is its key under `users`).
-    """
-    for name, hint in typing.get_type_hints(cls).items():
-        if name in skip or name not in raw:
+def _named(raw, key: str, path: str, errors: list[str]):
+    """(name, section, dotted path) for each entry of the mapping raw[key] --
+    each user, each network.  An entry whose name is not text, or whose body is
+    not a mapping, is reported and skipped."""
+    group = _section(raw, key, path, errors)
+    group_path = _join(path, key)
+    for name, body in (group or {}).items():
+        if not isinstance(name, str):
+            errors.append(f"{group_path}: a name must be text, but YAML read one "
+                          f"as {_describe(name)}{_quote_hint(name, str)}")
             continue
-        if not _matches(raw[name], hint):
-            errors.append(_mismatch(path + name, raw[name], hint))
+        body = _as_mapping(body, _join(group_path, name), errors)
+        if body is not None:
+            yield name, body, _join(group_path, name)
 
 
-def _validate_raw(raw) -> list[str]:
-    """Every problem with the shape of the loaded YAML `raw`, one line each.
+# --- Checking one value against a field's type ---------------------------------
 
-    It mirrors the walk `BouncerConfig.load` makes, so that `load` may assume
-    every section it reads is a mapping and every value has its field's type.
+
+@functools.cache
+def _hints(cls) -> dict:
+    return typing.get_type_hints(cls)
+
+
+def _arms(hint) -> tuple:
+    """The alternatives of a union type; a lone type is its own only alternative."""
+    origin = typing.get_origin(hint)
+    if origin is typing.Union or origin is types.UnionType:
+        return typing.get_args(hint)
+    return (hint,)
+
+
+def _is_bool(value) -> bool:
+    # ruamel loads an anchored boolean as ScalarBoolean, which subclasses int.
+    return isinstance(value, (bool, ScalarBoolean))
+
+
+def _matches(value, hint) -> bool:
+    """Whether `value`, as YAML loaded it, is acceptable for a field annotated `hint`.
+
+    A choice (Literal) matches in any case; _canonical gives its stored spelling.
     """
-    errors: list[str] = []
-    _check_mapping(raw, BouncerConfig, "", errors,
-                   skip={"listen", "logging", "ident", "users"})
-    for key, cls in (("listen", ListenConfig), ("logging", LoggingConfig),
-                     ("ident", IdentConfig)):
-        if key in raw and _as_mapping(raw[key], key, errors) is not None:
-            _check_mapping(raw[key], cls, key + ".", errors)
+    arms = _arms(hint)
+    if len(arms) > 1:
+        return any(_matches(value, arm) for arm in arms)
+    origin = typing.get_origin(hint)
+    if hint is type(None):
+        return value is None
+    if hint is bool:
+        return _is_bool(value)
+    if hint is int:
+        return isinstance(value, int) and not _is_bool(value)
+    if hint is float:
+        return isinstance(value, (int, float)) and not _is_bool(value)
+    if hint is str:
+        return isinstance(value, str)
+    if origin is Literal:
+        return isinstance(value, str) and value.lower() in (
+            c.lower() for c in typing.get_args(hint))
+    if origin is list:
+        (item,) = typing.get_args(hint)
+        return isinstance(value, list) and all(_matches(v, item) for v in value)
+    if origin is dict:
+        key, val = typing.get_args(hint)
+        return isinstance(value, dict) and all(
+            _matches(k, key) and _matches(v, val) for k, v in value.items())
+    raise TypeError(f"no rule for checking a config value against {hint!r}")
 
-    users = _as_mapping(raw["users"], "users", errors) if "users" in raw else None
-    for uname, udata in (users or {}).items():
-        upath = f"users.{uname}"
-        if _as_mapping(udata, upath, errors) is None:
-            continue
-        _check_mapping(udata, UserConfig, upath + ".", errors,
-                       skip={"username", "networks"})
-        networks = (_as_mapping(udata["networks"], upath + ".networks", errors)
-                    if "networks" in udata else None)
-        for nname, ndata in (networks or {}).items():
-            npath = f"{upath}.networks.{nname}"
-            if _as_mapping(ndata, npath, errors) is None:
-                continue
-            _check_mapping(ndata, NetworkConfig, npath + ".", errors,
-                           skip={"name", "servers", "sasl", "autojoin"})
-            if "autojoin" in ndata and not _matches(ndata["autojoin"], _AUTOJOIN):
-                errors.append(_mismatch(npath + ".autojoin", ndata["autojoin"], _AUTOJOIN))
-            if "sasl" in ndata and _as_mapping(ndata["sasl"], npath + ".sasl", errors) is not None:
-                _check_mapping(ndata["sasl"], SASLConfig, npath + ".sasl.", errors)
-            if "server" in ndata and _as_mapping(ndata["server"], npath + ".server", errors) is not None:
-                _check_mapping(ndata["server"], ServerConfig, npath + ".server.", errors)
-            if "servers" in ndata:
-                servers = ndata["servers"]
-                if not isinstance(servers, list):
-                    errors.append(f"{npath}.servers: should be a list of servers, "
-                                  f"but YAML read it as {_describe(servers)}")
-                    continue
-                for i, sc_data in enumerate(servers):
-                    spath = f"{npath}.servers[{i}]"
-                    if _as_mapping(sc_data, spath, errors) is not None:
-                        _check_mapping(sc_data, ServerConfig, spath + ".", errors)
-    return errors
+
+def _canonical(value, hint):
+    """`value`, with a choice spelled the way the schema spells it."""
+    if isinstance(value, str):
+        for arm in _arms(hint):
+            if typing.get_origin(arm) is Literal:
+                for choice in typing.get_args(arm):
+                    if choice.lower() == value.lower():
+                        return choice
+    return value
+
+
+def _check(value, hint, path: str, errors: list[str], secret: bool = False) -> bool:
+    """Whether `value` fits `hint`; if not, report the innermost part that does not.
+
+    A list or mapping of the right kind is looked into, so the message names
+    the item that is wrong rather than the whole container.
+    secret: the value is a password, so messages say what kind of value it is
+        but never what it is.
+    """
+    if _matches(value, hint):
+        return True
+    container = next(
+        (arm for arm in _arms(hint)
+         if (typing.get_origin(arm) is list and isinstance(value, list))
+         or (typing.get_origin(arm) is dict and isinstance(value, dict))),
+        None)
+    if container is None:
+        errors.append(f"{path}: should be {_expected(hint)}, but YAML read it as "
+                      f"{_describe(value, secret)}{_quote_hint(value, hint)}")
+    elif typing.get_origin(container) is list:
+        (item,) = typing.get_args(container)
+        for i, v in enumerate(value):
+            _check(v, item, f"{path}[{i}]", errors, secret)
+    else:
+        key_hint, val_hint = typing.get_args(container)
+        for k, v in value.items():
+            if not _matches(k, key_hint):
+                errors.append(f"{path}: a key should be {_expected(key_hint)}, but YAML "
+                              f"read one as {_describe(k)}{_quote_hint(k, key_hint)}")
+            else:
+                _check(v, val_hint, f"{path}.{k}", errors, secret)
+    return False
+
+
+def _quote_hint(value, hint) -> str:
+    """Advice to quote, for a value YAML did not read as text where text would do."""
+    if value is None or isinstance(value, str) or str not in _arms(hint):
+        return ""
+    return "; put it in quotes to keep it as text"
+
+
+def _expected(hint) -> str:
+    """`hint` in the words of someone editing the file."""
+    arms = _arms(hint)
+    text = " or ".join(_expected_one(a) for a in arms if a is not type(None))
+    return text + " (or left empty)" if type(None) in arms else text
+
+
+def _expected_one(hint) -> str:
+    origin = typing.get_origin(hint)
+    if origin is Literal:
+        return "one of " + ", ".join(typing.get_args(hint))
+    if origin is list:
+        return "a list of " + _expected_inner(typing.get_args(hint)[0])
+    if origin is dict:
+        key, val = typing.get_args(hint)
+        return f"a mapping of {_expected_inner(key)} to {_expected_inner(val)}"
+    return {str: "text", int: "a whole number", float: "a number",
+            bool: "true or false"}[hint]
+
+
+def _expected_inner(hint) -> str:
+    # Inside a list or mapping, an allowed None is not worth spelling out.
+    return " or ".join(_expected_one(a) for a in _arms(hint) if a is not type(None))
+
+
+def _describe(value, secret: bool = False) -> str:
+    """What YAML made of `value`, in the words of someone editing the file.
+
+    secret: say what kind of value it is, but not what it is.
+    """
+    if value is None:
+        return "nothing (the key is empty)"
+    if _is_bool(value):
+        kind, shown = "a boolean", f"the boolean {str(bool(value)).lower()}"
+    elif isinstance(value, (int, float)):
+        kind, shown = "a number", f"the number {value}"
+    elif isinstance(value, str):
+        kind, shown = "text", f"the text {str(value)!r}"
+    elif isinstance(value, datetime.date):  # datetime.datetime subclasses it
+        kind, shown = "a date", f"the date {value}"
+    elif isinstance(value, dict):
+        noun = "key" if len(value) == 1 else "keys"
+        kind = shown = "an empty mapping" if not value else "a mapping"
+        if value:
+            shown += f" with the {noun} " + ", ".join(repr(str(k)) for k in value)
+    elif isinstance(value, list):
+        kind = shown = ("an empty list" if not value else
+                        f"a list of {len(value)} item{'' if len(value) == 1 else 's'}")
+    else:
+        kind = shown = type(value).__name__
+    return kind if secret else shown

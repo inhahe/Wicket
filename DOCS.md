@@ -266,13 +266,22 @@ users:
           - "#python"
 ```
 
-Every value is checked when the file is loaded, at startup and on
-`REHASH`. A value of the wrong type stops the load with a message
-naming the key, such as
-`realname: should be text, but YAML read it as a mapping`. YAML gives
-some unquoted text a meaning of its own: `{...}` is a mapping, `[...]`
-a list, `0123` the number 123, `1e3` the number 1000, and `true` a
-boolean. Put such text in quotes: `realname: "{I'm an OP}"`.
+The file is checked when it is loaded, at startup and on `REHASH`, and
+any problem stops the load with a message naming the key:
+
+- A value of the wrong type, such as
+  `realname: should be text, but YAML read it as a mapping`. YAML gives
+  some unquoted text a meaning of its own: `{...}` is a mapping, `[...]`
+  a list, `0123` the number 123, `1e3` the number 1000, `2026-10-11` a
+  date, and `true` a boolean. Put such text in quotes:
+  `realname: "{I'm an OP}"`.
+- A key Wicket does not read at that level, usually a misspelling:
+  `auto_conect: not a setting Wicket reads here; did you mean auto_connect?`
+- A setting with fixed choices (`delivery`, `replay_activity_target`,
+  `logging.level`, `sasl.mechanism`) set to something else. The
+  choices may be written in any case.
+
+Messages never repeat the value of a `password`.
 
 ### Top-level keys
 
@@ -587,7 +596,7 @@ does not error in that case.
 
 ```yaml
 logging:
-  level: "info"           # debug, info, warning, error
+  level: "info"           # debug, info, warning, error, critical
   file: "/var/log/wicket.log"
   max_bytes: 10000000     # 10 MB rotation threshold
   backup_count: 5         # number of rotated files to keep
@@ -675,8 +684,9 @@ in-memory password still updates and a warning is logged.
 ## Live rehash
 
 `REHASH` (or `SIGHUP` on Unix) reloads `config.yaml` and applies
-changes without dropping connections. If the file has errors, `REHASH`
-lists them and changes nothing; the running configuration stays.
+changes without dropping connections. If the file cannot be loaded,
+`REHASH` lists the problems and changes nothing; the running
+configuration stays.
 
 **Safe changes** (applied immediately):
 
