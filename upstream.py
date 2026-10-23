@@ -54,16 +54,18 @@ class UpstreamConnection:
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.rate_limiter: Optional[RateLimiter] = None
-        self.cap: CapNegotiator = CapNegotiator(
-            is_upstream=True,
-            extra_wanted=set(network_config.caps_wanted),
-            override_caps=set(network_config.upstream_caps) if network_config.upstream_caps is not None else None,
-        )
-
-        self.nick: str = network_config.nick
-        self.username: str = network_config.user
-        self.realname: str = network_config.realname
-        self.registered: bool = False
+        # What one connection negotiates: the CAP state, the nick, user and
+        # realname it registers with, the welcome it got.  See _start_fresh.
+        self.cap: CapNegotiator
+        self.nick: str
+        self.username: str
+        self.realname: str
+        self.registered: bool
+        self.welcome_msgs: list[IRCMessage]
+        # Nick fallback: [primary, alt1, alt2, ...], then primary_, primary__, ...
+        self._nick_candidates: list[str]
+        self._nick_attempt_index: int
+        self._start_fresh()
         self.connected: bool = False
 
         self.isupport: dict[str, str | None] = {}
@@ -77,13 +79,6 @@ class UpstreamConnection:
         # argument, so the arguments line up with the letters that own them.
         self.chan_modes: str = ""
         self.casemapping: str = "rfc1459"
-
-        # Registration numerics to replay to clients
-        self.welcome_msgs: list[IRCMessage] = []
-
-        # Nick fallback: build list of [primary, alt1, alt2, ..., primary_, primary__, ...]
-        self._nick_candidates: list[str] = [network_config.nick] + list(network_config.alt_nicks)
-        self._nick_attempt_index: int = 0
 
         # Server rotation
         self._server_index: int = 0
@@ -131,6 +126,30 @@ class UpstreamConnection:
         # the first connection (overwriting reader/writer/_read_task),
         # creating zombie connections that are never cleaned up.
         self._connecting: bool = False
+
+    def _start_fresh(self) -> None:
+        """Reset what one connection negotiates, from the config as it is now.
+
+        Run before every attempt, whatever started it -- startup, a reconnect,
+        CONNECT, a client attaching -- so a REHASH that changed the nick, user,
+        realname, alt_nicks or caps reaches the next registration.  Kept as
+        copies rather than read from the config at each use because `nick`
+        changes during a session and the rest describe the registration the
+        server accepted.
+        """
+        nc = self.network_config
+        self.cap = CapNegotiator(
+            is_upstream=True,
+            extra_wanted=set(nc.caps_wanted),
+            override_caps=set(nc.upstream_caps) if nc.upstream_caps is not None else None,
+        )
+        self.nick = nc.nick
+        self.username = nc.user
+        self.realname = nc.realname
+        self.registered = False
+        self.welcome_msgs = []
+        self._nick_candidates = [nc.nick] + list(nc.alt_nicks)
+        self._nick_attempt_index = 0
 
     @property
     def reconnect_pending(self) -> bool:
@@ -186,6 +205,7 @@ class UpstreamConnection:
         # This is idempotent and harmless if already cleaned up.
         if self.connected or self.writer:
             await self._cleanup()
+        self._start_fresh()
 
         # Try each server starting from the current index
         for attempt in range(len(servers)):
@@ -392,15 +412,6 @@ class UpstreamConnection:
         if not self._should_reconnect:
             return
         self._reconnect_task = None
-        # Reset state for new connection
-        self.cap = CapNegotiator(
-            is_upstream=True,
-            extra_wanted=set(self.network_config.caps_wanted),
-        )
-        self.welcome_msgs = []
-        self.registered = False
-        self.nick = self.network_config.nick
-        self._nick_attempt_index = 0
         await self.connect()
 
     async def _read_loop(self) -> None:

@@ -688,28 +688,41 @@ changes without dropping connections. If the file cannot be loaded,
 `REHASH` lists the problems and changes nothing; the running
 configuration stays.
 
-**Safe changes** (applied immediately):
+Every changed setting is taken over, and `REHASH` lists each one.
+They differ only in when they take effect.
+
+**Applied immediately:**
 
 - Logging configuration
-- Top-level cascading defaults
 - Per-user passwords, delivery, delivery_source
 - Per-network `rate_limit_ms` (live-applied to active connections)
-- Autojoin lists, capability lists
+- Autojoin lists, `unclean_reconnect_delay`, `downstream_caps` (for
+  clients that attach from then on)
 - `auto_connect` — applied **live**: turning it off disconnects the
   network (and cancels any reconnect in progress); turning it on
   connects a network that is currently down. Only an actual change to
   the value acts, so an unrelated `REHASH` never revives a network you
   took down by hand with `DISCONNECT`.
-- `replay_activity` and `replay_activity_target` settings
+- `replay_activity`, `replay_activity_target` and
+  `channel_replay_activity`
 - New users
 - New networks (auto-connected if configured)
 
-**Changes that need a reconnect to take effect** (config is updated
-in memory; next reconnect uses the new values):
+A changed top-level or user-level default is reported, and applied,
+on every network it reaches.
 
-- `nick`, `user`, `realname`, `ident_username`
-- SASL configuration
+**Applied on the next connection** to the network, however it starts
+(a reconnect, `CONNECT`, a client attaching to a network that is
+down):
+
+- `nick`, `alt_nicks`, `user`, `realname`, `ident_username`
+- The network's server `password`, and SASL configuration
 - Server list
+- `caps_wanted`, `upstream_caps`
+
+**Applied when Wicket restarts:** `listen`, `database`, `ident` and
+`server_name`. `REHASH` reports these as pending every time until
+then.
 
 **Removed users/networks** are not disconnected; you must restart
 Wicket to drop them.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 import argparse
 import asyncio
+import dataclasses
 import io
 import logging
 import logging.handlers
@@ -13,7 +14,7 @@ import ssl
 import sys
 from typing import Optional
 
-from config import BouncerConfig, set_user_password
+from config import BouncerConfig, NetworkConfig, UserConfig, set_user_password
 from database import Database
 from ident import IdentServer
 from downstream import DownstreamConnection
@@ -21,6 +22,18 @@ from upstream import UpstreamConnection
 from user import User
 
 logger = logging.getLogger(__name__)
+
+# Top-level settings that only startup reads: the listening socket, the
+# database, the ident server, and the server name each User is built with.
+_RESTART_ONLY = frozenset({"listen", "database", "ident", "server_name"})
+
+# Network settings used only while connecting and registering.  The rest act
+# from the moment REHASH copies them (rate_limit_ms and auto_connect with
+# work of their own).
+_NETWORK_ON_RECONNECT = frozenset({
+    "servers", "nick", "alt_nicks", "user", "ident_username", "realname",
+    "password", "sasl", "caps_wanted", "upstream_caps",
+})
 
 
 class Bouncer:
@@ -174,28 +187,31 @@ class Bouncer:
         return True, messages
 
     async def _apply_config(self, new_config: BouncerConfig, messages: list[str]) -> None:
-        """Apply the safe changes in `new_config` to the running bouncer,
-        appending a line to `messages` for each."""
-        # Update logging
-        self.config.logging = new_config.logging
-        _setup_logging(new_config, self._cli_args)
-        messages.append("Logging configuration reloaded")
+        """Apply `new_config` to the running bouncer, appending a line to
+        `messages` for each change.
 
-        # Update top-level cascading defaults
-        self.config.nick = new_config.nick
-        self.config.alt_nicks = new_config.alt_nicks
-        self.config.user = new_config.user
-        self.config.ident_username = new_config.ident_username
-        self.config.realname = new_config.realname
-        self.config.delivery = new_config.delivery
-        self.config.delivery_source = new_config.delivery_source
-        self.config.caps_wanted = new_config.caps_wanted
-        self.config.upstream_caps = new_config.upstream_caps
-        self.config.downstream_caps = new_config.downstream_caps
-        self.config.rate_limit_ms = new_config.rate_limit_ms
-        self.config.auto_connect = new_config.auto_connect
-        self.config.replay_activity = new_config.replay_activity
-        self.config.replay_activity_target = new_config.replay_activity_target
+        Every field that differs is taken over, so no setting in the file is
+        dropped; fields differ only in when they take effect, which the message
+        says.  The exception is _RESTART_ONLY, kept at its running value so
+        that every REHASH until the restart still reports it as pending.
+        """
+        if new_config.logging != self.config.logging:
+            self.config.logging = new_config.logging
+            _setup_logging(new_config, self._cli_args)
+            messages.append("Logging configuration reloaded")
+
+        for f in dataclasses.fields(BouncerConfig):
+            if f.name in ("users", "logging"):
+                continue
+            new = getattr(new_config, f.name)
+            if new == getattr(self.config, f.name):
+                continue
+            if f.name in _RESTART_ONLY:
+                messages.append(f"{f.name} changed (takes effect when Wicket restarts)")
+            else:
+                # A cascading default; the loader has already applied it to
+                # every user and network it reaches, which report it below.
+                setattr(self.config, f.name, new)
 
         # Process users
         for uname, new_ucfg in new_config.users.items():
@@ -215,16 +231,19 @@ class Bouncer:
             user = self.users[uname]
             old_ucfg = user.config
 
-            # Safe user-level changes
-            if old_ucfg.password != new_ucfg.password:
-                old_ucfg.password = new_ucfg.password
-                messages.append(f"{uname}: password updated")
-            if old_ucfg.delivery != new_ucfg.delivery:
-                old_ucfg.delivery = new_ucfg.delivery
-                messages.append(f"{uname}: delivery changed to {new_ucfg.delivery}")
-            if old_ucfg.delivery_source != new_ucfg.delivery_source:
-                old_ucfg.delivery_source = new_ucfg.delivery_source
-                messages.append(f"{uname}: delivery_source changed to {new_ucfg.delivery_source}")
+            for f in dataclasses.fields(UserConfig):
+                if f.name in ("username", "networks"):
+                    continue
+                new = getattr(new_ucfg, f.name)
+                if new == getattr(old_ucfg, f.name):
+                    continue
+                setattr(old_ucfg, f.name, new)
+                # The rest are cascading defaults, reported by the networks
+                # they reach.
+                if f.name == "password":
+                    messages.append(f"{uname}: password updated")
+                elif f.name in ("delivery", "delivery_source"):
+                    messages.append(f"{uname}: {f.name} changed to {new}")
 
             # Process networks
             for nname, new_ncfg in new_ucfg.networks.items():
@@ -240,44 +259,27 @@ class Bouncer:
                     continue
 
                 old_ncfg = old_ucfg.networks[nname]
+                changed = [f.name for f in dataclasses.fields(NetworkConfig)
+                           if getattr(old_ncfg, f.name) != getattr(new_ncfg, f.name)]
+                # The upstream reads its config when it next connects
+                # (UpstreamConnection._start_fresh), so copying is applying.
+                for name in changed:
+                    setattr(old_ncfg, name, getattr(new_ncfg, name))
+                upstream = user.upstreams.get(nname)
 
-                # Warn about changes that need reconnect
-                reconnect_fields = []
-                if old_ncfg.nick != new_ncfg.nick:
-                    reconnect_fields.append("nick")
-                if old_ncfg.user != new_ncfg.user:
-                    reconnect_fields.append("user")
-                if old_ncfg.realname != new_ncfg.realname:
-                    reconnect_fields.append("realname")
-                if old_ncfg.ident_username != new_ncfg.ident_username:
-                    reconnect_fields.append("ident_username")
-                if old_ncfg.sasl != new_ncfg.sasl:
-                    reconnect_fields.append("sasl")
-                if old_ncfg.servers != new_ncfg.servers:
-                    reconnect_fields.append("servers")
-                if reconnect_fields:
-                    fields_str = ", ".join(reconnect_fields)
-                    messages.append(
-                        f"{uname}/{nname}: {fields_str} changed (takes effect on reconnect)"
-                    )
-                    # Still update the config so reconnect uses new values
-                    old_ncfg.nick = new_ncfg.nick
-                    old_ncfg.alt_nicks = new_ncfg.alt_nicks
-                    old_ncfg.user = new_ncfg.user
-                    old_ncfg.realname = new_ncfg.realname
-                    old_ncfg.ident_username = new_ncfg.ident_username
-                    old_ncfg.sasl = new_ncfg.sasl
-                    old_ncfg.servers = new_ncfg.servers
+                on_reconnect = [n for n in changed if n in _NETWORK_ON_RECONNECT]
+                if on_reconnect:
+                    messages.append(f"{uname}/{nname}: {', '.join(on_reconnect)} "
+                                    f"changed (takes effect on reconnect)")
+                live = [n for n in changed if n not in _NETWORK_ON_RECONNECT
+                        and n not in ("rate_limit_ms", "auto_connect")]
+                if live:
+                    messages.append(f"{uname}/{nname}: {', '.join(live)} updated")
 
-                # Safe network-level changes
-                if old_ncfg.rate_limit_ms != new_ncfg.rate_limit_ms:
-                    old_ncfg.rate_limit_ms = new_ncfg.rate_limit_ms
-                    upstream = user.upstreams.get(nname)
+                if "rate_limit_ms" in changed:
                     if upstream and upstream.rate_limiter and upstream.connected:
                         await upstream.update_rate_limit(new_ncfg.rate_limit_ms)
                     messages.append(f"{uname}/{nname}: rate_limit_ms changed to {new_ncfg.rate_limit_ms}")
-
-                old_ncfg.autojoin = new_ncfg.autojoin
 
                 # auto_connect is applied live, not just remembered for the next
                 # startup. Turning it off is how you say "stay off undernet
@@ -286,9 +288,7 @@ class Bouncer:
                 # retrying) until you happened to restart Wicket. Only an actual
                 # change acts, so an unrelated REHASH never disturbs a network
                 # you took down by hand with DISCONNECT.
-                if old_ncfg.auto_connect != new_ncfg.auto_connect:
-                    old_ncfg.auto_connect = new_ncfg.auto_connect
-                    upstream = user.upstreams.get(nname)
+                if "auto_connect" in changed:
                     if upstream is None:
                         pass
                     elif new_ncfg.auto_connect:
@@ -301,12 +301,6 @@ class Bouncer:
                     else:
                         await upstream.disconnect("auto_connect disabled")
                         messages.append(f"{uname}/{nname}: auto_connect disabled, disconnected")
-                old_ncfg.caps_wanted = new_ncfg.caps_wanted
-                old_ncfg.upstream_caps = new_ncfg.upstream_caps
-                old_ncfg.downstream_caps = new_ncfg.downstream_caps
-                old_ncfg.replay_activity = new_ncfg.replay_activity
-                old_ncfg.replay_activity_target = new_ncfg.replay_activity_target
-                old_ncfg.channel_replay_activity = new_ncfg.channel_replay_activity
 
         # Warn about removed users (don't disconnect them)
         for uname in list(self.users.keys()):
