@@ -419,9 +419,15 @@ class DownstreamConnection:
         # collected an "excessive connections" G-line, and -- because the dial
         # had just re-armed the reconnect machinery -- scheduled a 25h retry
         # that resurrected the network a day later.  See bugs.txt.)
+        #
+        # Nor for one that already has a reconnect scheduled.  Its delay is
+        # deliberate -- a ban floor, or the wait for the server to reap a ghost
+        # session -- and dialling inside it renews exactly what it waits out.
+        # The scheduled attempt would also still fire, and _connect_inner tears
+        # down whatever connection it finds, including the one dialled here.
         upstream = user.upstreams[network]
         if (not upstream.connected and not upstream.registered
-                and upstream.reconnect_enabled):
+                and upstream.reconnect_enabled and not upstream.reconnect_pending):
             self._connect_task = asyncio.create_task(upstream.connect())
             # Store reference so it doesn't get GC'd
             self._connect_task.add_done_callback(lambda t: None)
